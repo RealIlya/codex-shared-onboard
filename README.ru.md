@@ -28,6 +28,31 @@ python codex_shared_onboard.py doctor
 
 `self-test` работает только во временных папках внутри текущей директории. Он не трогает реальный `.codex`.
 
+## CLI Launcher
+
+Чтобы установить локальную команду `codex-shared-onboard`:
+
+```bash
+python codex_shared_onboard.py install-cli
+python codex_shared_onboard.py install-cli --apply
+```
+
+По умолчанию launcher создаётся тут:
+
+```text
+~/.local/bin/codex-shared-onboard
+```
+
+На Windows создаётся `codex-shared-onboard.cmd`, а bin-директория добавляется
+в user `PATH`. После установки откройте новый терминал.
+
+На Linux/macOS убедитесь, что `~/.local/bin` есть в `PATH`, и затем вызывайте:
+
+```bash
+codex-shared-onboard doctor
+codex-shared-onboard install --apply
+```
+
 ## Основная Схема
 
 Не синхронизируйте `.codex` целиком.
@@ -150,6 +175,16 @@ python codex_shared_onboard.py install --apply
 ```text
 ~/.codex/skills/<skill-name>
 ```
+
+Если локальный skill с таким именем уже существует как обычная директория,
+`install --apply` сохранит его тут:
+
+```text
+~/.codex/skills-backups/<skill-name>.bak-local-YYYYMMDD-HHMMSS
+```
+
+Backups лежат вне `~/.codex/skills`, чтобы Codex не регистрировал их как
+дубликаты активных skills.
 
 `.system` skills не шарятся. Это локальная часть конкретной установки Codex.
 

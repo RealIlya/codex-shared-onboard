@@ -28,6 +28,31 @@ python codex_shared_onboard.py doctor
 
 `self-test` only uses temporary directories under the current working directory. It does not touch your real `.codex`.
 
+## CLI Launcher
+
+To install a local `codex-shared-onboard` command:
+
+```bash
+python codex_shared_onboard.py install-cli
+python codex_shared_onboard.py install-cli --apply
+```
+
+By default this writes:
+
+```text
+~/.local/bin/codex-shared-onboard
+```
+
+On Windows this writes `codex-shared-onboard.cmd` and adds the bin directory to
+the current user's `PATH`. Open a new terminal after installation.
+
+On Linux/macOS, make sure `~/.local/bin` is on `PATH`, then use:
+
+```bash
+codex-shared-onboard doctor
+codex-shared-onboard install --apply
+```
+
 ## Core Model
 
 Do not sync `.codex` as a whole.
@@ -150,6 +175,16 @@ they become available to local Codex through:
 ```text
 ~/.codex/skills/<skill-name>
 ```
+
+If a local skill with the same name already exists as a real directory,
+`install --apply` preserves it under:
+
+```text
+~/.codex/skills-backups/<skill-name>.bak-local-YYYYMMDD-HHMMSS
+```
+
+Backups are kept outside `~/.codex/skills` so Codex does not register them as
+duplicate active skills.
 
 `.system` skills are not shared. They are local to each Codex installation.
 
