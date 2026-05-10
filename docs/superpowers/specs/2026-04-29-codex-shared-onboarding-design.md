@@ -48,6 +48,7 @@ Commands:
 python codex_shared_onboard.py doctor
 python codex_shared_onboard.py install
 python codex_shared_onboard.py install --apply
+python codex_shared_onboard.py install-cli --apply
 python codex_shared_onboard.py install --configure-syncthing --apply
 python codex_shared_onboard.py snapshot --apply
 python codex_shared_onboard.py self-test

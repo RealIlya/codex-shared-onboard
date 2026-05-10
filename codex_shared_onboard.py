@@ -11,9 +11,11 @@ import contextlib
 import datetime as dt
 import io
 import json
+import ntpath
 import os
 import platform
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -58,6 +60,8 @@ Rules:
 """
 
 MEMORY_KEY_FILES = ("MEMORY.md", "memory_summary.md", "raw_memories.md")
+WINDOWS_PATH_REGISTRY_KEY = "Environment"
+WINDOWS_PATH_VALUE_NAME = "Path"
 
 
 def now_stamp() -> str:
@@ -109,6 +113,10 @@ def default_shared_dir() -> Path:
         if win_user:
             return Path("/mnt/c/Users") / win_user / ".codex-shared"
     return Path.home() / ".codex-shared"
+
+
+def default_bin_dir() -> Path:
+    return Path.home() / ".local" / "bin"
 
 
 @dataclass
@@ -579,7 +587,7 @@ def prepare_shared_layout(ctx: Context) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Prepare Codex shared skills and diagnostics.")
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Prepare Codex shared skills and diagnostics.")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
     parser.add_argument("--apply", action="store_true", help="Actually change files. Default is dry-run.")
@@ -600,6 +608,10 @@ def build_parser() -> argparse.ArgumentParser:
     adopt.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     link = memories_sub.add_parser("link", help="Link local memories to an existing shared memories directory.")
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
+    install_cli = sub.add_parser("install-cli", help=f"Install a local '{APP_NAME}' launcher.")
+    install_cli.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
+    install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
+    install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
     sub.add_parser("self-test", help="Run tests in temporary folders only.")
     return parser
 
@@ -758,6 +770,152 @@ def command_install(ctx: Context, configure_syncthing: bool, args: argparse.Name
     link_shared_skills(ctx)
     if configure_syncthing:
         configure_syncthing_folder(ctx, args.syncthing_url, args.syncthing_api_key)
+    return 1 if ctx.errors else 0
+
+
+def cli_launcher_name() -> str:
+    return f"{APP_NAME}.cmd" if is_windows() else APP_NAME
+
+
+def render_cli_launcher(script_path: Path) -> str:
+    if is_windows():
+        return f"@echo off\r\npy -3 \"{script_path}\" %*\r\n"
+    return f"#!/usr/bin/env sh\nexec python3 {shlex.quote(str(script_path))} \"$@\"\n"
+
+
+def ensure_executable(ctx: Context, path: Path) -> None:
+    if is_windows() or not ctx.apply:
+        return
+    try:
+        current_mode = path.stat().st_mode
+        path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError as exc:
+        ctx.error(f"Failed to mark launcher executable {path}: {exc}")
+
+
+def normalize_windows_path_entry(path: str) -> str:
+    expanded = os.path.expandvars(path.strip().strip('"'))
+    return ntpath.normcase(ntpath.normpath(expanded))
+
+
+def windows_path_contains(path_value: str, directory: Path) -> bool:
+    expected = normalize_windows_path_entry(str(directory))
+    for entry in path_value.split(";"):
+        if not entry.strip():
+            continue
+        if normalize_windows_path_entry(entry) == expected:
+            return True
+    return False
+
+
+def append_windows_path(path_value: str, directory: Path) -> str:
+    directory_text = str(directory)
+    if not path_value.strip():
+        return directory_text
+    return f"{path_value.rstrip(';')};{directory_text}"
+
+
+def broadcast_windows_environment_change(ctx: Context) -> None:
+    if not ctx.apply:
+        return
+    try:
+        import ctypes
+    except ImportError as exc:
+        ctx.warn(f"Could not notify Windows about PATH update: {exc}")
+        return
+
+    hwnd_broadcast = 0xFFFF
+    wm_settingchange = 0x001A
+    smto_abortifhung = 0x0002
+    result = ctypes.c_ulong()
+    try:
+        ctypes.windll.user32.SendMessageTimeoutW(
+            hwnd_broadcast,
+            wm_settingchange,
+            0,
+            "Environment",
+            smto_abortifhung,
+            5000,
+            ctypes.byref(result),
+        )
+    except (AttributeError, OSError) as exc:
+        ctx.warn(f"Could not notify Windows about PATH update: {exc}")
+
+
+def ensure_windows_user_path(ctx: Context, directory: Path) -> None:
+    if not is_windows():
+        return
+    try:
+        import winreg
+    except ImportError as exc:
+        ctx.error(f"Could not update Windows PATH because winreg is unavailable: {exc}")
+        return
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_PATH_REGISTRY_KEY, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            try:
+                current_value, value_type = winreg.QueryValueEx(key, WINDOWS_PATH_VALUE_NAME)
+            except FileNotFoundError:
+                current_value, value_type = "", winreg.REG_EXPAND_SZ
+            if not isinstance(current_value, str):
+                ctx.error(f"Windows user PATH registry value has unexpected type: {type(current_value).__name__}")
+                return
+            if windows_path_contains(current_value, directory):
+                ctx.info(f"Windows user PATH already contains: {directory}")
+                return
+            updated_value = append_windows_path(current_value, directory)
+            ctx.plan(f"add {directory} to Windows user PATH")
+            if ctx.apply:
+                if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                    value_type = winreg.REG_EXPAND_SZ
+                winreg.SetValueEx(key, WINDOWS_PATH_VALUE_NAME, 0, value_type, updated_value)
+                broadcast_windows_environment_change(ctx)
+                ctx.info("Windows user PATH updated. Open a new terminal before running the command.")
+    except OSError as exc:
+        ctx.error(f"Failed to update Windows user PATH: {exc}")
+
+
+def command_install_cli(ctx: Context, args: argparse.Namespace) -> int:
+    script_path = Path(__file__).resolve()
+    if not script_path.is_file():
+        ctx.error(f"Cannot find source script: {script_path}")
+        return 1
+
+    bin_dir = args.bin_dir.expanduser()
+    launcher = bin_dir / cli_launcher_name()
+    expected_text = render_cli_launcher(script_path)
+
+    if launcher.exists() or launcher.is_symlink():
+        if launcher.is_dir() and not launcher.is_symlink():
+            ctx.error(f"Launcher path exists as a directory: {launcher}")
+            return 1
+        try:
+            current_text = launcher.read_text(encoding="utf-8")
+        except OSError as exc:
+            ctx.error(f"Failed to read existing launcher {launcher}: {exc}")
+            return 1
+        if current_text == expected_text:
+            ctx.info(f"CLI launcher already installed: {launcher}")
+            ensure_executable(ctx, launcher)
+            return 1 if ctx.errors else 0
+        if not args.force:
+            ctx.error(f"Launcher already exists with different content: {launcher}. Re-run with --force to overwrite it.")
+            return 1
+
+    if not ensure_dir(ctx, bin_dir):
+        return 1
+    ctx.plan(f"write CLI launcher {launcher} -> {script_path}")
+    if ctx.apply:
+        try:
+            launcher.write_text(expected_text, encoding="utf-8", newline="")
+        except OSError as exc:
+            ctx.error(f"Failed to write CLI launcher {launcher}: {exc}")
+            return 1
+        ensure_executable(ctx, launcher)
+    if is_windows():
+        ensure_windows_user_path(ctx, bin_dir)
+    else:
+        ctx.info(f"Make sure {bin_dir} is on PATH before running {APP_NAME}.")
     return 1 if ctx.errors else 0
 
 
@@ -1010,6 +1168,41 @@ def command_self_test() -> int:
         assert_true((local_skill / "SKILL.md").read_text(encoding="utf-8") == "# Shared demo skill\n", "local skill should expose shared SKILL.md")
         assert_true(same_resolved_path(local_skill, shared_skill), "local demo-skill should resolve to shared skill")
 
+        cli_bin_dir = case_dir / "bin"
+        cli_launcher = cli_bin_dir / APP_NAME
+        cli_dry_run_code = run_script(
+            [
+                "install-cli",
+                "--bin-dir",
+                str(cli_bin_dir),
+            ]
+        )
+        assert_true(cli_dry_run_code == 0, "dry-run install-cli should return 0")
+        assert_true(not cli_launcher.exists(), "dry-run install-cli should not create launcher")
+
+        cli_apply_code = run_script(
+            [
+                "install-cli",
+                "--bin-dir",
+                str(cli_bin_dir),
+                "--apply",
+            ]
+        )
+        assert_true(cli_apply_code == 0, "apply install-cli should return 0")
+        assert_true(cli_launcher.is_file(), "install-cli should create launcher")
+        assert_true(windows_path_contains("C:\\Tools;C:\\Users\\Admin\\.local\\bin", Path("C:/Users/Admin/.local/bin")), "windows_path_contains should match normalized paths")
+        assert_true(append_windows_path("C:\\Tools;", Path("C:/Users/Admin/.local/bin")) == "C:\\Tools;C:/Users/Admin/.local/bin", "append_windows_path should append without duplicate separator")
+        if not is_windows():
+            assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
+            help_result = subprocess.run(
+                [str(cli_launcher), "--help"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert_true(help_result.returncode == 0, "installed launcher should run --help")
+            assert_true(APP_NAME in help_result.stdout, "installed launcher help should mention app name")
+
         memories_dir = shared_dir / "memories"
         memories_dir.mkdir()
         conflict_file = memories_dir / "MEMORY.sync-conflict-test.md"
@@ -1142,6 +1335,8 @@ def main(argv: list[str] | None = None) -> int:
         return command_doctor(ctx)
     if args.command == "snapshot":
         return command_snapshot(ctx)
+    if args.command == "install-cli":
+        return command_install_cli(ctx, args)
     if args.command == "memories":
         if args.memories_command == "adopt":
             return command_memories_adopt(ctx)
