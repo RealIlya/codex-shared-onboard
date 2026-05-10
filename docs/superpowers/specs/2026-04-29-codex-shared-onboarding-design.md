@@ -105,7 +105,7 @@ The script must never:
 If `.codex/skills/<skill>` exists as a normal directory, the script may rename it to:
 
 ```text
-<skill>.bak-local-YYYYMMDD-HHMMSS
+.codex/skills-backups/<skill>.bak-local-YYYYMMDD-HHMMSS
 ```
 
 Only after backup rename may it create a link to:

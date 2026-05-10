@@ -151,6 +151,16 @@ they become available to local Codex through:
 ~/.codex/skills/<skill-name>
 ```
 
+If a local skill with the same name already exists as a real directory,
+`install --apply` preserves it under:
+
+```text
+~/.codex/skills-backups/<skill-name>.bak-local-YYYYMMDD-HHMMSS
+```
+
+Backups are kept outside `~/.codex/skills` so Codex does not register them as
+duplicate active skills.
+
 `.system` skills are not shared. They are local to each Codex installation.
 
 ## Snapshot

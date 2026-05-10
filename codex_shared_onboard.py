@@ -126,6 +126,10 @@ class Context:
         return self.codex_dir / "skills"
 
     @property
+    def skills_backups_dir(self) -> Path:
+        return self.codex_dir / "skills-backups"
+
+    @property
     def shared_skills_dir(self) -> Path:
         return self.shared_dir / "skills-user"
 
@@ -243,6 +247,18 @@ def next_backup_path(path: Path) -> Path:
     index = 1
     while True:
         candidate = path.with_name(f"{base.name}-{index}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def next_backup_path_in_dir(path: Path, backup_dir: Path) -> Path:
+    base = backup_dir / f"{path.name}.bak-local-{now_stamp()}"
+    if not base.exists():
+        return base
+    index = 1
+    while True:
+        candidate = backup_dir / f"{base.name}-{index}"
         if not candidate.exists():
             return candidate
         index += 1
@@ -371,6 +387,7 @@ def replace_local_skill(ctx: Context, link: Path, pending: Path, backup: Path) -
     if not ctx.apply:
         return
     try:
+        backup.parent.mkdir(parents=True, exist_ok=True)
         link.rename(backup)
         pending.rename(link)
     except OSError as exc:
@@ -546,7 +563,7 @@ def link_shared_skills(ctx: Context) -> None:
         if link.is_symlink():
             replace_wrong_symlink(ctx, link, pending)
         elif link_exists:
-            backup = next_backup_path(link)
+            backup = next_backup_path_in_dir(link, ctx.skills_backups_dir)
             replace_local_skill(ctx, link, pending, backup)
 
 
@@ -985,9 +1002,11 @@ def command_self_test() -> int:
         assert_true((shared_dir / ".stignore").is_file(), "apply install should create .stignore")
         assert_true((shared_dir / "memory-policy.md").is_file(), "apply install should create memory-policy.md")
 
-        backups = sorted((codex_dir / "skills").glob("demo-skill.bak-local-*"))
+        backups = sorted((codex_dir / "skills-backups").glob("demo-skill.bak-local-*"))
         assert_true(len(backups) == 1, "apply install should backup existing local demo-skill")
         assert_true((backups[0] / "SKILL.md").read_text(encoding="utf-8") == "# Local demo skill\n", "backup should keep local skill")
+        active_skill_backups = sorted((codex_dir / "skills").glob("demo-skill.bak-local-*"))
+        assert_true(not active_skill_backups, "skill backups should not stay under active skills dir")
         assert_true((local_skill / "SKILL.md").read_text(encoding="utf-8") == "# Shared demo skill\n", "local skill should expose shared SKILL.md")
         assert_true(same_resolved_path(local_skill, shared_skill), "local demo-skill should resolve to shared skill")
 

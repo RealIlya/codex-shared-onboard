@@ -151,6 +151,16 @@ python codex_shared_onboard.py install --apply
 ~/.codex/skills/<skill-name>
 ```
 
+Если локальный skill с таким именем уже существует как обычная директория,
+`install --apply` сохранит его тут:
+
+```text
+~/.codex/skills-backups/<skill-name>.bak-local-YYYYMMDD-HHMMSS
+```
+
+Backups лежат вне `~/.codex/skills`, чтобы Codex не регистрировал их как
+дубликаты активных skills.
+
 `.system` skills не шарятся. Это локальная часть конкретной установки Codex.
 
 ## Snapshot
