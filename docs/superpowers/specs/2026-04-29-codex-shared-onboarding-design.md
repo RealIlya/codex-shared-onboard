@@ -48,6 +48,7 @@ Commands:
 python codex_shared_onboard.py doctor
 python codex_shared_onboard.py install
 python codex_shared_onboard.py install --apply
+python codex_shared_onboard.py install-cli --apply
 python codex_shared_onboard.py install --configure-syncthing --apply
 python codex_shared_onboard.py snapshot --apply
 python codex_shared_onboard.py self-test
@@ -105,7 +106,7 @@ The script must never:
 If `.codex/skills/<skill>` exists as a normal directory, the script may rename it to:
 
 ```text
-<skill>.bak-local-YYYYMMDD-HHMMSS
+.codex/skills-backups/<skill>.bak-local-YYYYMMDD-HHMMSS
 ```
 
 Only after backup rename may it create a link to:
