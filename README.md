@@ -47,6 +47,7 @@ Global options:
 --verbose                   Print extra diagnostic details for subprocesses and API calls.
 --syncthing-url URL         Syncthing REST API URL. Defaults to http://127.0.0.1:8384.
 --syncthing-api-key KEY     Syncthing API key. If omitted, the script tries to read it from local Syncthing config.
+--version                   Print the tool version and exit.
 -h, --help                  Show help.
 ```
 
@@ -59,6 +60,7 @@ snapshot                    Create a local Git snapshot of .codex-shared.
 memories adopt              Copy local .codex/memories into .codex-shared/memories and switch local memories to the platform-specific shared layout.
 memories link               Connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
 install-cli                 Install a local codex-shared-onboard launcher.
+version                     Print the tool version.
 self-test                   Run the script's temporary-directory test suite.
 ```
 
@@ -120,6 +122,19 @@ On Linux/macOS, make sure `~/.local/bin` is on `PATH`, then use:
 ```bash
 codex-shared-onboard doctor
 codex-shared-onboard install --apply
+```
+
+The launcher is a small shim that points to this `codex_shared_onboard.py` file. Updating the checked-out script usually updates the installed command automatically:
+
+```bash
+git pull --ff-only
+codex-shared-onboard version
+```
+
+Re-run `install-cli --apply --force` only when you moved the repository, changed the launcher target path, or need to replace a launcher with different content:
+
+```bash
+python codex_shared_onboard.py install-cli --apply --force
 ```
 
 ## Core Model
