@@ -28,6 +28,75 @@ python codex_shared_onboard.py doctor
 
 `self-test` only uses temporary directories under the current working directory. It does not touch your real `.codex`.
 
+## Command Reference
+
+General form:
+
+```bash
+python codex_shared_onboard.py [global-options] <command> [command-options]
+```
+
+After installing the launcher, `codex-shared-onboard` can be used instead of `python codex_shared_onboard.py`.
+
+Global options:
+
+```text
+--codex-dir PATH            Local Codex home. Defaults to ~/.codex.
+--shared-dir PATH           Shared layer directory. Defaults to ~/.codex-shared, or /mnt/c/Users/<WindowsUser>/.codex-shared in WSL when detected.
+--apply                     Actually change files. Without it, mutating commands run in dry-run mode.
+--verbose                   Print extra diagnostic details for subprocesses and API calls.
+--syncthing-url URL         Syncthing REST API URL. Defaults to http://127.0.0.1:8384.
+--syncthing-api-key KEY     Syncthing API key. If omitted, the script tries to read it from local Syncthing config.
+-h, --help                  Show help.
+```
+
+Commands:
+
+```text
+install                     Prepare .codex-shared and link shared user skills into .codex/skills.
+doctor                      Diagnose paths, tools, shared files, memory layout, conflicts, and skill links.
+snapshot                    Create a local Git snapshot of .codex-shared.
+memories adopt              Copy local .codex/memories into .codex-shared/memories and switch local memories to the platform-specific shared layout.
+memories link               Connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
+install-cli                 Install a local codex-shared-onboard launcher.
+self-test                   Run the script's temporary-directory test suite.
+```
+
+Command options:
+
+```text
+install --apply             Apply install changes. Without it, print the planned changes only.
+install --configure-syncthing
+                            Try to register .codex-shared in local Syncthing through the REST API.
+
+snapshot --apply            Initialize/use Git in .codex-shared and commit the current shared state.
+
+memories adopt --apply      Apply writer adoption. Refuses to overwrite existing .codex-shared/memories.
+memories link --apply       Apply reader/shared memory linking. Refuses to continue on memory conflict files.
+
+install-cli --apply         Write the launcher. Without it, print the planned changes only.
+install-cli --bin-dir PATH  Directory for the launcher. Defaults to ~/.local/bin.
+install-cli --force         Overwrite an existing launcher when its content differs.
+install-cli --no-path-update
+                            On Windows, do not add the launcher directory to the user's PATH.
+```
+
+Dry-run examples:
+
+```bash
+python codex_shared_onboard.py install
+python codex_shared_onboard.py memories link
+python codex_shared_onboard.py snapshot
+```
+
+Apply examples:
+
+```bash
+python codex_shared_onboard.py install --apply
+python codex_shared_onboard.py memories link --apply
+python codex_shared_onboard.py snapshot --apply
+```
+
 ## CLI Launcher
 
 To install a local `codex-shared-onboard` command:
@@ -67,8 +136,25 @@ Local `.codex` consumes shared parts through links:
 
 ```text
 ~/.codex/skills/<skill> -> ~/.codex-shared/skills-user/<skill>
-~/.codex/memories      -> ~/.codex-shared/memories
 ```
+
+Memory linking is platform-specific:
+
+```text
+Windows:
+  ~/.codex/memories -> ~/.codex-shared/memories
+
+WSL/Linux:
+  ~/.codex/memories/                  real local directory
+  ~/.codex/memories/MEMORY.md         -> ~/.codex-shared/memories/MEMORY.md
+  ~/.codex/memories/memory_summary.md -> ~/.codex-shared/memories/memory_summary.md
+  ~/.codex/memories/raw_memories.md   -> ~/.codex-shared/memories/raw_memories.md
+  ~/.codex/memories/rollout_summaries -> ~/.codex-shared/memories/rollout_summaries
+  ~/.codex/memories/extensions        -> ~/.codex-shared/memories/extensions
+  plus any other non-internal top-level memory artifacts
+```
+
+WSL/Linux intentionally does not link `.git`, `.agents`, or `.codex` from shared memories. A whole-directory symlink can break Codex sandboxing when shared memories contain Codex-owned internal state.
 
 ## First Machine / Writer
 
@@ -87,7 +173,7 @@ python codex_shared_onboard.py memories adopt --apply
 
 - Copies local `.codex/memories` into `.codex-shared/memories`.
 - Renames the old local `.codex/memories` to `memories.bak-local-YYYYMMDD-HHMMSS`.
-- Creates a symlink or junction `.codex/memories -> .codex-shared/memories`.
+- Creates the platform-specific memory layout.
 - Does not delete the original memories.
 - Does not overwrite an existing `.codex-shared/memories`.
 
@@ -123,7 +209,7 @@ python codex_shared_onboard.py memories link --apply
 
 - Verifies that `.codex-shared/memories` exists.
 - Backs up local `.codex/memories` if it exists.
-- Creates a symlink or junction `.codex/memories -> .codex-shared/memories`.
+- Creates the platform-specific memory layout.
 - Does not copy local reader memories over shared memories.
 
 For a reader machine, use this in `~/.codex/config.toml`:
@@ -222,7 +308,7 @@ If conflicts exist:
 To roll back from shared memories:
 
 1. Close Codex CLI.
-2. Remove the `.codex/memories` junction or symlink.
+2. Remove the Windows `.codex/memories` junction, or move the WSL/Linux real `.codex/memories` directory aside after removing its per-entry links.
 3. Rename the desired backup back to `.codex/memories`.
 
 Example backup:

@@ -57,9 +57,12 @@ Rules:
 - Do not silently resolve Syncthing conflict files.
 - If memory conflicts exist, mention them before relying on memory-derived assumptions.
 - Do not manually edit MEMORY.md, memory_summary.md, or raw_memories.md unless explicitly requested.
+- Windows may link .codex/memories to .codex-shared/memories as a junction.
+- WSL/Linux should use a real .codex/memories directory with per-entry symlinks, excluding .git, .agents, and .codex.
 """
 
 MEMORY_KEY_FILES = ("MEMORY.md", "memory_summary.md", "raw_memories.md")
+MEMORY_LINK_EXCLUDES = {".git", ".agents", ".codex"}
 WINDOWS_PATH_REGISTRY_KEY = "Environment"
 WINDOWS_PATH_VALUE_NAME = "Path"
 
@@ -467,6 +470,97 @@ def verify_memory_link(ctx: Context, link: Path, target: Path) -> bool:
     return False
 
 
+def memory_entry_targets(shared: Path) -> list[Path]:
+    try:
+        entries = list(shared.iterdir())
+    except OSError:
+        return []
+    return [
+        path
+        for path in sorted(entries, key=lambda item: item.name.casefold())
+        if path.name not in MEMORY_LINK_EXCLUDES
+    ]
+
+
+def memory_entry_layout_ok(local: Path, shared: Path) -> bool:
+    if not local.exists() or not local.is_dir() or is_link_like_path(local):
+        return False
+    targets = memory_entry_targets(shared)
+    if not targets:
+        return False
+    target_names = {target.name for target in targets}
+    try:
+        local_entries = list(local.iterdir())
+    except OSError:
+        return False
+    for entry in local_entries:
+        if entry.name not in target_names:
+            return False
+    for target in targets:
+        link = local / target.name
+        if not path_exists_or_link(link) or not same_resolved_path(link, target):
+            return False
+    return True
+
+
+def create_memory_entry_link(ctx: Context, link: Path, target: Path) -> bool:
+    ctx.plan(f"create memory entry symlink {link} -> {target}")
+    if not ctx.apply:
+        return True
+    try:
+        os.symlink(target, link, target_is_directory=target.is_dir())
+    except OSError as exc:
+        ctx.error(f"Failed to create memory entry symlink {link} -> {target}: {exc}")
+        return False
+    return True
+
+
+def create_memory_entry_layout(ctx: Context, local: Path, shared: Path) -> bool:
+    if memory_entry_layout_ok(local, shared):
+        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
+        return True
+    if not ensure_dir(ctx, local):
+        return False
+
+    targets = memory_entry_targets(shared)
+    if not targets:
+        ctx.error(f"Shared memories directory has no linkable entries: {shared}")
+        return False
+
+    for excluded in MEMORY_LINK_EXCLUDES:
+        link = local / excluded
+        if not path_exists_or_link(link):
+            continue
+        ctx.error(f"Local memories must not expose Codex-owned internal entry on WSL/Linux: {link}")
+        return False
+
+    for target in targets:
+        link = local / target.name
+        if path_exists_or_link(link) and same_resolved_path(link, target):
+            continue
+        if path_exists_or_link(link):
+            backup = next_backup_path(link)
+            if not rename_path(ctx, link, backup, "local memory entry to backup"):
+                return False
+        if not create_memory_entry_link(ctx, link, target):
+            return False
+    if ctx.apply and not memory_entry_layout_ok(local, shared):
+        ctx.error(f"Memory entry layout verification failed: {local} does not match {shared}")
+        return False
+    return True
+
+
+def create_memory_layout(ctx: Context, local: Path, shared: Path) -> bool:
+    if is_windows():
+        if path_exists_or_link(local) and same_resolved_path(local, shared):
+            ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
+            return True
+        if not create_directory_link(ctx, local, shared):
+            return False
+        return verify_memory_link(ctx, local, shared)
+    return create_memory_entry_layout(ctx, local, shared)
+
+
 def warn_memory_key_files(ctx: Context, root: Path, label: str) -> None:
     for name in MEMORY_KEY_FILES:
         if (root / name).is_file():
@@ -478,8 +572,11 @@ def command_memories_adopt(ctx: Context) -> int:
     local = ctx.memories_dir
     shared = ctx.shared_memories_dir
 
-    if path_exists_or_link(local) and same_resolved_path(local, shared):
+    if is_windows() and path_exists_or_link(local) and same_resolved_path(local, shared):
         ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
+        return 0
+    if not is_windows() and memory_entry_layout_ok(local, shared):
+        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
         return 0
 
     if not local.exists() or not local.is_dir() or is_link_like_path(local):
@@ -500,14 +597,13 @@ def command_memories_adopt(ctx: Context) -> int:
         return 1
     if not rename_path(ctx, local, backup, "local memories to backup"):
         return 1
-    if not create_directory_link(ctx, local, shared):
+    if not create_memory_layout(ctx, local, shared):
         if ctx.apply and not path_exists_or_link(local) and backup.exists():
             try:
                 backup.rename(local)
             except OSError as exc:
                 ctx.error(f"Failed to restore local memories backup {backup} -> {local}: {exc}")
         return 1
-    verify_memory_link(ctx, local, shared)
     return 1 if ctx.errors else 0
 
 
@@ -521,15 +617,18 @@ def command_memories_link(ctx: Context) -> int:
         return 1
     if not validate_no_conflicts(ctx, shared, "shared memories"):
         return 1
-    if path_exists_or_link(local) and same_resolved_path(local, shared):
+    if is_windows() and path_exists_or_link(local) and same_resolved_path(local, shared):
         ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
+        return 0
+    if not is_windows() and memory_entry_layout_ok(local, shared):
+        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
         return 0
     if not ensure_dir(ctx, ctx.codex_dir):
         return 1
 
     warn_memory_key_files(ctx, shared, "shared memories")
     if path_exists_or_link(local):
-        if not local.is_dir() or is_link_like_path(local):
+        if not local.is_dir():
             ctx.error(f"Local memories path exists but is not a replaceable real directory: {local}")
             return 1
         if not validate_no_conflicts(ctx, local, "local memories"):
@@ -537,9 +636,8 @@ def command_memories_link(ctx: Context) -> int:
         backup = next_backup_path(local)
         if not rename_path(ctx, local, backup, "local memories to backup"):
             return 1
-    if not create_directory_link(ctx, local, shared):
+    if not create_memory_layout(ctx, local, shared):
         return 1
-    verify_memory_link(ctx, local, shared)
     return 1 if ctx.errors else 0
 
 
@@ -612,6 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     install_cli.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
     install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
+    install_cli.add_argument("--no-path-update", action="store_true", help="Do not add the launcher directory to PATH.")
     sub.add_parser("self-test", help="Run tests in temporary folders only.")
     return parser
 
@@ -912,9 +1011,9 @@ def command_install_cli(ctx: Context, args: argparse.Namespace) -> int:
             ctx.error(f"Failed to write CLI launcher {launcher}: {exc}")
             return 1
         ensure_executable(ctx, launcher)
-    if is_windows():
+    if is_windows() and not args.no_path_update:
         ensure_windows_user_path(ctx, bin_dir)
-    else:
+    elif not is_windows():
         ctx.info(f"Make sure {bin_dir} is on PATH before running {APP_NAME}.")
     return 1 if ctx.errors else 0
 
@@ -995,6 +1094,22 @@ def command_doctor(ctx: Context) -> int:
     syncthing = tool_path("syncthing")
     print(f"git={git if git else 'missing'}")
     print(f"syncthing={syncthing if syncthing else 'missing'}")
+
+    local_memories = ctx.memories_dir
+    shared_memories = ctx.shared_memories_dir
+    if not path_exists_or_link(local_memories):
+        ctx.warn(f"Local memories path is missing: {local_memories}")
+    elif is_windows():
+        if shared_memories.exists() and same_resolved_path(local_memories, shared_memories):
+            print(f"memories=linked local={local_memories} shared={shared_memories}")
+        else:
+            ctx.warn(f"Local memories are not linked to shared memories: {local_memories}")
+    elif is_link_like_path(local_memories):
+        ctx.warn(f"Local memories should be a real directory on WSL/Linux, not a whole-directory link: {local_memories}")
+    elif shared_memories.exists() and memory_entry_layout_ok(local_memories, shared_memories):
+        print(f"memories=per-entry-linked local={local_memories} shared={shared_memories}")
+    elif shared_memories.exists():
+        ctx.warn(f"Local memories do not match the WSL/Linux per-entry shared layout: {local_memories}")
 
     for target in iter_shared_skills(ctx):
         local = ctx.skills_dir / target.name
@@ -1169,12 +1284,13 @@ def command_self_test() -> int:
         assert_true(same_resolved_path(local_skill, shared_skill), "local demo-skill should resolve to shared skill")
 
         cli_bin_dir = case_dir / "bin"
-        cli_launcher = cli_bin_dir / APP_NAME
+        cli_launcher = cli_bin_dir / cli_launcher_name()
         cli_dry_run_code = run_script(
             [
                 "install-cli",
                 "--bin-dir",
                 str(cli_bin_dir),
+                "--no-path-update",
             ]
         )
         assert_true(cli_dry_run_code == 0, "dry-run install-cli should return 0")
@@ -1185,13 +1301,14 @@ def command_self_test() -> int:
                 "install-cli",
                 "--bin-dir",
                 str(cli_bin_dir),
+                "--no-path-update",
                 "--apply",
             ]
         )
         assert_true(cli_apply_code == 0, "apply install-cli should return 0")
         assert_true(cli_launcher.is_file(), "install-cli should create launcher")
         assert_true(windows_path_contains("C:\\Tools;C:\\Users\\Admin\\.local\\bin", Path("C:/Users/Admin/.local/bin")), "windows_path_contains should match normalized paths")
-        assert_true(append_windows_path("C:\\Tools;", Path("C:/Users/Admin/.local/bin")) == "C:\\Tools;C:/Users/Admin/.local/bin", "append_windows_path should append without duplicate separator")
+        assert_true(append_windows_path("C:\\Tools;", Path("C:/Users/Admin/.local/bin")) == f"C:\\Tools;{Path('C:/Users/Admin/.local/bin')}", "append_windows_path should append without duplicate separator")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
@@ -1293,6 +1410,30 @@ def command_self_test() -> int:
         link_backups = sorted(link_codex.glob("memories.bak-local-*"))
         assert_true(len(link_backups) == 1, "link should backup existing local memories")
         assert_true((link_backups[0] / "MEMORY.md").read_text(encoding="utf-8") == "reader-local memory\n", "link backup should keep original reader memories")
+
+        entry_layout_shared = case_dir / "memory-entry-layout" / ".codex-shared" / "memories"
+        for name in ("rollout_summaries", "extensions", ".git", ".agents"):
+            (entry_layout_shared / name).mkdir(parents=True)
+        for name in ("MEMORY.md", "memory_summary.md", "raw_memories.md", ".codex"):
+            (entry_layout_shared / name).write_text(f"{name}\n", encoding="utf-8", newline="\n")
+        entry_names = [path.name for path in memory_entry_targets(entry_layout_shared)]
+        assert_true(".git" not in entry_names, "WSL/Linux memory entry layout must exclude .git")
+        assert_true(".agents" not in entry_names, "WSL/Linux memory entry layout must exclude .agents")
+        assert_true(".codex" not in entry_names, "WSL/Linux memory entry layout must exclude .codex marker")
+        assert_true("MEMORY.md" in entry_names, "WSL/Linux memory entry layout should include MEMORY.md")
+        assert_true("rollout_summaries" in entry_names, "WSL/Linux memory entry layout should include rollout_summaries")
+        assert_true("extensions" in entry_names, "WSL/Linux memory entry layout should include extensions")
+        if not is_windows():
+            entry_layout_local = case_dir / "memory-entry-layout" / ".codex" / "memories"
+            entry_layout_ctx = Context(case_dir / "memory-entry-layout" / ".codex", case_dir / "memory-entry-layout" / ".codex-shared", apply=True)
+            assert_true(create_memory_entry_layout(entry_layout_ctx, entry_layout_local, entry_layout_shared), "WSL/Linux memory entry layout should be created")
+            assert_true(not path_exists_or_link(entry_layout_local / ".git"), "WSL/Linux memory entry layout must not link .git")
+            assert_true(not path_exists_or_link(entry_layout_local / ".agents"), "WSL/Linux memory entry layout must not link .agents")
+            assert_true(not path_exists_or_link(entry_layout_local / ".codex"), "WSL/Linux memory entry layout must not link .codex marker")
+            assert_true(same_resolved_path(entry_layout_local / "MEMORY.md", entry_layout_shared / "MEMORY.md"), "WSL/Linux MEMORY.md should resolve to shared file")
+            assert_true(same_resolved_path(entry_layout_local / "extensions", entry_layout_shared / "extensions"), "WSL/Linux extensions should resolve to shared directory")
+            (entry_layout_local / "stale-local.md").write_text("stale\n", encoding="utf-8", newline="\n")
+            assert_true(not memory_entry_layout_ok(entry_layout_local, entry_layout_shared), "WSL/Linux memory entry layout should reject stale local-only entries")
 
         stub_case = case_dir / "link-stub"
         stub_link = stub_case / "local-link"
