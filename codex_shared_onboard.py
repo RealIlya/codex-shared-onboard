@@ -30,6 +30,7 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
+APP_VERSION = "0.2.0"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
 STIGNORE_TEXT = """(?d)**/__pycache__
 (?d)**/*.pyc
@@ -597,6 +598,9 @@ def command_memories_adopt(ctx: Context) -> int:
         return 1
     if not rename_path(ctx, local, backup, "local memories to backup"):
         return 1
+    if not ctx.apply and not is_windows():
+        ctx.plan(f"create per-entry memory layout {local} -> {shared}")
+        return 1 if ctx.errors else 0
     if not create_memory_layout(ctx, local, shared):
         if ctx.apply and not path_exists_or_link(local) and backup.exists():
             try:
@@ -686,6 +690,7 @@ def prepare_shared_layout(ctx: Context) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=APP_NAME, description="Prepare Codex shared skills and diagnostics.")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
     parser.add_argument("--apply", action="store_true", help="Actually change files. Default is dry-run.")
@@ -711,6 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
     install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
     install_cli.add_argument("--no-path-update", action="store_true", help="Do not add the launcher directory to PATH.")
+    sub.add_parser("version", help="Print the tool version.")
     sub.add_parser("self-test", help="Run tests in temporary folders only.")
     return parser
 
@@ -876,10 +882,11 @@ def cli_launcher_name() -> str:
     return f"{APP_NAME}.cmd" if is_windows() else APP_NAME
 
 
-def render_cli_launcher(script_path: Path) -> str:
+def render_cli_launcher(script_path: Path, python_executable: Path | None = None) -> str:
+    python_path = python_executable or Path(sys.executable)
     if is_windows():
-        return f"@echo off\r\npy -3 \"{script_path}\" %*\r\n"
-    return f"#!/usr/bin/env sh\nexec python3 {shlex.quote(str(script_path))} \"$@\"\n"
+        return f"@echo off\r\n\"{python_path}\" \"{script_path}\" %*\r\n"
+    return f"#!/usr/bin/env sh\nexec {shlex.quote(str(python_path))} {shlex.quote(str(script_path))} \"$@\"\n"
 
 
 def ensure_executable(ctx: Context, path: Path) -> None:
@@ -1124,6 +1131,11 @@ def command_doctor(ctx: Context) -> int:
     return 1 if ctx.errors else 0
 
 
+def command_version() -> int:
+    print(f"{APP_NAME} {APP_VERSION}")
+    return 0
+
+
 def run_checked(ctx: Context, command: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
     if ctx.verbose:
         ctx.info(f"run cwd={cwd}: {' '.join(command)}")
@@ -1309,6 +1321,23 @@ def command_self_test() -> int:
         assert_true(cli_launcher.is_file(), "install-cli should create launcher")
         assert_true(windows_path_contains("C:\\Tools;C:\\Users\\Admin\\.local\\bin", Path("C:/Users/Admin/.local/bin")), "windows_path_contains should match normalized paths")
         assert_true(append_windows_path("C:\\Tools;", Path("C:/Users/Admin/.local/bin")) == f"C:\\Tools;{Path('C:/Users/Admin/.local/bin')}", "append_windows_path should append without duplicate separator")
+        script_path = Path(__file__).resolve()
+        version_result = subprocess.run(
+            [sys.executable, str(script_path), "--version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(version_result.returncode == 0, "--version should return 0")
+        assert_true(version_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "--version should print app version")
+        version_command_result = subprocess.run(
+            [sys.executable, str(script_path), "version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(version_command_result.returncode == 0, "version command should return 0")
+        assert_true(version_command_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "version command should print app version")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
@@ -1378,7 +1407,10 @@ def command_self_test() -> int:
         )
         assert_true(adopt_apply_code == 0, "apply memories adopt should return 0")
         assert_true((adopt_shared_memories / "MEMORY.md").read_text(encoding="utf-8") == "local writer memory\n", "adopt should copy local memories into shared")
-        assert_true(same_resolved_path(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through local path")
+        if is_windows():
+            assert_true(same_resolved_path(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through local path")
+        else:
+            assert_true(memory_entry_layout_ok(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through per-entry layout")
         adopt_backups = sorted(adopt_codex.glob("memories.bak-local-*"))
         assert_true(len(adopt_backups) == 1, "adopt should backup original local memories")
         assert_true((adopt_backups[0] / "MEMORY.md").read_text(encoding="utf-8") == "local writer memory\n", "adopt backup should keep original local memories")
@@ -1405,7 +1437,10 @@ def command_self_test() -> int:
             ]
         )
         assert_true(link_apply_code == 0, "apply memories link should return 0")
-        assert_true(same_resolved_path(link_local_memories, link_shared_memories), "link should expose shared memories through local path")
+        if is_windows():
+            assert_true(same_resolved_path(link_local_memories, link_shared_memories), "link should expose shared memories through local path")
+        else:
+            assert_true(memory_entry_layout_ok(link_local_memories, link_shared_memories), "link should expose shared memories through per-entry layout")
         assert_true((link_local_memories / "MEMORY.md").read_text(encoding="utf-8") == "shared memory\n", "link should not overwrite shared memories")
         link_backups = sorted(link_codex.glob("memories.bak-local-*"))
         assert_true(len(link_backups) == 1, "link should backup existing local memories")
@@ -1478,6 +1513,8 @@ def main(argv: list[str] | None = None) -> int:
         return command_snapshot(ctx)
     if args.command == "install-cli":
         return command_install_cli(ctx, args)
+    if args.command == "version":
+        return command_version()
     if args.command == "memories":
         if args.memories_command == "adopt":
             return command_memories_adopt(ctx)

@@ -47,6 +47,7 @@ python codex_shared_onboard.py [global-options] <command> [command-options]
 --verbose                   Печатать дополнительные диагностические детали для subprocess/API-вызовов.
 --syncthing-url URL         URL Syncthing REST API. По умолчанию http://127.0.0.1:8384.
 --syncthing-api-key KEY     API key Syncthing. Если не указан, скрипт пытается прочитать его из локального Syncthing config.
+--version                   Показать версию инструмента и выйти.
 -h, --help                  Показать help.
 ```
 
@@ -59,6 +60,7 @@ snapshot                    Сделать локальный Git snapshot ди�
 memories adopt              Скопировать локальную .codex/memories в .codex-shared/memories и переключить локальные memories на platform-specific shared layout.
 memories link               Подключить локальную .codex/memories к существующей .codex-shared/memories без копирования local reader memories поверх shared memories.
 install-cli                 Установить локальный launcher codex-shared-onboard.
+version                     Показать версию инструмента.
 self-test                   Запустить test suite скрипта во временных директориях.
 ```
 
@@ -120,6 +122,19 @@ python codex_shared_onboard.py install-cli --apply
 ```bash
 codex-shared-onboard doctor
 codex-shared-onboard install --apply
+```
+
+Launcher - это маленький shim, который указывает на этот файл `codex_shared_onboard.py`. Поэтому после обновления checkout установленная команда обычно обновляется автоматически:
+
+```bash
+git pull --ff-only
+codex-shared-onboard version
+```
+
+Повторно запускайте `install-cli --apply --force` только если репозиторий был перемещён, изменился target path launcher-а или нужно заменить launcher с другим содержимым:
+
+```bash
+python codex_shared_onboard.py install-cli --apply --force
 ```
 
 ## Основная Схема
