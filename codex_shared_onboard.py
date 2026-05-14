@@ -31,46 +31,10 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
-MAIN_HELP_EPILOG = """command reference:
-  Global options:
-    --codex-dir PATH                 Codex home directory to inspect or modify.
-    --shared-dir PATH                Shared .codex-shared directory.
-    --apply                          Execute filesystem changes. Without it, commands are dry-run.
-    --verbose                        Print additional command/runtime details.
-    --syncthing-url URL              Syncthing REST API URL for install --configure-syncthing.
-    --syncthing-api-key KEY          Syncthing API key. If omitted, config.xml is inspected when possible.
-
-  Commands:
-    install [--apply] [--configure-syncthing]
-      Prepare .codex-shared, write shared policy files, and link shared user skills into .codex/skills.
-
-    doctor [--codex] [--codex-only] [--codex-read-repo]
-           [--codex-profile PROFILE] [--codex-model MODEL]
-           [--codex-extra-prompt TEXT]
-      Diagnose local .codex/.codex-shared state. Optionally pass diagnostics to Codex CLI.
-
-    snapshot [--apply]
-      Create a local Git snapshot in .codex-shared.
-
-    memories adopt [--apply]
-      Copy the current real .codex/memories directory into .codex-shared/memories, back up the local directory,
-      then link .codex/memories to the shared directory. Intended for the writer/source machine.
-
-    memories link [--apply]
-      Link .codex/memories to an existing .codex-shared/memories directory. Intended for reader/additional machines.
-
-    install-cli [--apply] [--bin-dir PATH] [--force] [--no-path-update]
-      Install or update the codex-shared-onboard launcher script.
-
-    version
-      Print the tool version.
-
-    self-test
-      Run built-in tests in temporary folders only.
-"""
+MAIN_HELP_EPILOG = f"Run '{APP_NAME} <command> --help' for detailed command behavior."
 DOCTOR_HELP_EPILOG = """Codex analysis behavior:
   --codex
     Captures doctor diagnostics and sends them to 'codex exec' for explanation.
@@ -829,7 +793,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     install = sub.add_parser(
         "install",
-        help="Prepare shared folder and link shared user skills.",
+        help="Prepare shared folder and link shared user skills. Options: --apply, --configure-syncthing.",
         description="Prepare .codex-shared and link shared user skills into .codex/skills.",
         epilog=INSTALL_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -838,7 +802,7 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--configure-syncthing", action="store_true", help="Try to add .codex-shared to the local Syncthing configuration.")
     doctor = sub.add_parser(
         "doctor",
-        help="Diagnose shared Codex setup.",
+        help="Diagnose shared Codex setup. Options: --codex, --codex-only, --codex-read-repo, --codex-profile, --codex-model, --codex-extra-prompt.",
         description="Diagnose .codex/.codex-shared links, memories, shared skills, Git, and Syncthing availability.",
         epilog=DOCTOR_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -851,7 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--codex-extra-prompt", default=None, help="Extra instructions appended to the Codex analysis prompt.")
     snapshot = sub.add_parser(
         "snapshot",
-        help="Create a local Git snapshot of .codex-shared.",
+        help="Create a local Git snapshot of .codex-shared. Options: --apply.",
         description="Create a local Git snapshot of .codex-shared for rollback/history.",
         epilog=SNAPSHOT_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -859,7 +823,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     memories = sub.add_parser(
         "memories",
-        help="Manage Codex memories links between .codex and .codex-shared.",
+        help="Manage Codex memories links between .codex and .codex-shared. Subcommands: adopt --apply, link --apply.",
         description="Manage Codex memories as a whole-directory shared link.",
         epilog=MEMORIES_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -883,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli = sub.add_parser(
         "install-cli",
-        help=f"Install a local '{APP_NAME}' launcher.",
+        help=f"Install a local '{APP_NAME}' launcher. Options: --apply, --bin-dir, --force, --no-path-update.",
         description=f"Install or update a local '{APP_NAME}' command launcher.",
         epilog=INSTALL_CLI_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1543,11 +1507,13 @@ def command_self_test() -> int:
             check=False,
         )
         assert_true(root_help_result.returncode == 0, "root --help should return 0")
-        assert_true("command reference:" in root_help_result.stdout, "root --help should include command reference")
-        assert_true("install [--apply] [--configure-syncthing]" in root_help_result.stdout, "root --help should describe install options")
-        assert_true("doctor [--codex] [--codex-only] [--codex-read-repo]" in root_help_result.stdout, "root --help should describe doctor options")
-        assert_true("memories adopt [--apply]" in root_help_result.stdout, "root --help should describe memories adopt")
-        assert_true("install-cli [--apply] [--bin-dir PATH] [--force] [--no-path-update]" in root_help_result.stdout, "root --help should describe install-cli options")
+        root_help_compact = " ".join(root_help_result.stdout.split())
+        assert_true("command reference:" not in root_help_result.stdout, "root --help should not duplicate argparse sections")
+        assert_true("Options: --apply, --configure-syncthing" in root_help_compact, "root --help should show install options in command list")
+        assert_true("Options: --codex, --codex-only" in root_help_compact, "root --help should show doctor options in command list")
+        assert_true("Subcommands: adopt --apply, link --apply" in root_help_compact, "root --help should show memories subcommands in command list")
+        assert_true("install-cli Install a local" in root_help_compact, "root --help should show install-cli command")
+        assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
         doctor_help_result = subprocess.run(
             [sys.executable, str(script_path), "doctor", "--help"],
             text=True,
