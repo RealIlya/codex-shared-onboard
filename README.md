@@ -71,6 +71,14 @@ install --apply             Apply install changes. Without it, print the planned
 install --configure-syncthing
                             Try to register .codex-shared in local Syncthing through the REST API.
 
+doctor --codex             Ask Codex CLI to explain captured diagnostics.
+doctor --codex-only        Print only Codex analysis, suppressing raw doctor output.
+doctor --codex-read-repo   Allow read-only repository inspection during Codex analysis.
+doctor --codex-profile P   Pass a Codex config profile to codex exec.
+doctor --codex-model M     Pass a Codex model to codex exec.
+doctor --codex-extra-prompt TEXT
+                            Append extra instructions to the Codex analysis prompt.
+
 snapshot --apply            Initialize/use Git in .codex-shared and commit the current shared state.
 
 memories adopt --apply      Apply writer adoption. Refuses to overwrite existing .codex-shared/memories.
@@ -87,6 +95,8 @@ Dry-run examples:
 
 ```bash
 python codex_shared_onboard.py install
+python codex_shared_onboard.py doctor --codex
+python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
 python codex_shared_onboard.py memories link
 python codex_shared_onboard.py snapshot
 ```
