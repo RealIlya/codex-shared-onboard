@@ -57,7 +57,7 @@ python codex_shared_onboard.py [global-options] <command> [command-options]
 install                     Подготовить .codex-shared и подключить shared user skills в .codex/skills.
 doctor                      Проверить paths, tools, shared-файлы, memory layout, conflicts и skill links.
 snapshot                    Сделать локальный Git snapshot директории .codex-shared.
-memories adopt              Скопировать локальную .codex/memories в .codex-shared/memories и переключить локальные memories на platform-specific shared layout.
+memories adopt              Скопировать локальную .codex/memories в .codex-shared/memories и залинковать локальные memories на shared-директорию.
 memories link               Подключить локальную .codex/memories к существующей .codex-shared/memories без копирования local reader memories поверх shared memories.
 install-cli                 Установить локальный launcher codex-shared-onboard.
 version                     Показать версию инструмента.
@@ -70,6 +70,14 @@ self-test                   Запустить test suite скрипта во в
 install --apply             Применить install-изменения. Без него только показать план.
 install --configure-syncthing
                             Попробовать зарегистрировать .codex-shared в локальном Syncthing через REST API.
+
+doctor --codex             Попросить Codex CLI объяснить captured diagnostics.
+doctor --codex-only        Печатать только Codex analysis без raw doctor output.
+doctor --codex-read-repo   Разрешить read-only чтение репозитория во время Codex analysis.
+doctor --codex-profile P   Передать Codex config profile в codex exec.
+doctor --codex-model M     Передать Codex model в codex exec.
+doctor --codex-extra-prompt TEXT
+                            Добавить дополнительные инструкции в Codex analysis prompt.
 
 snapshot --apply            Инициализировать/использовать Git в .codex-shared и закоммитить текущий shared state.
 
@@ -87,6 +95,8 @@ install-cli --no-path-update
 
 ```bash
 python codex_shared_onboard.py install
+python codex_shared_onboard.py doctor --codex
+python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
 python codex_shared_onboard.py memories link
 python codex_shared_onboard.py snapshot
 ```
@@ -153,23 +163,17 @@ python codex_shared_onboard.py install-cli --apply --force
 ~/.codex/skills/<skill> -> ~/.codex-shared/skills-user/<skill>
 ```
 
-Подключение memories зависит от платформы:
+Подключение memories использует ссылку на всю директорию:
 
 ```text
 Windows:
   ~/.codex/memories -> ~/.codex-shared/memories
 
 WSL/Linux:
-  ~/.codex/memories/                  реальная локальная директория
-  ~/.codex/memories/MEMORY.md         -> ~/.codex-shared/memories/MEMORY.md
-  ~/.codex/memories/memory_summary.md -> ~/.codex-shared/memories/memory_summary.md
-  ~/.codex/memories/raw_memories.md   -> ~/.codex-shared/memories/raw_memories.md
-  ~/.codex/memories/rollout_summaries -> ~/.codex-shared/memories/rollout_summaries
-  ~/.codex/memories/extensions        -> ~/.codex-shared/memories/extensions
-  плюс остальные не-внутренние top-level memory artifacts
+  ~/.codex/memories -> ~/.codex-shared/memories
 ```
 
-На WSL/Linux намеренно не линкуются `.git`, `.agents` и `.codex` из shared memories. Symlink на всю директорию может ломать sandbox Codex, когда внутри memories есть внутреннее состояние Codex.
+Так Codex-owned memory internals вроде `.git`, `.agents` и `.codex` остаются активными внутри локального пути `~/.codex/memories`. На WSL/Linux такая ссылка на всю директорию может вызывать проблемы Codex sandbox/bubblewrap, если shared path проходит через `/mnt/c`. Если это случилось, не удаляйте `.git`; сначала проверьте layout и решите вручную.
 
 ## Первая Машина / Writer
 
@@ -188,7 +192,7 @@ python codex_shared_onboard.py memories adopt --apply
 
 - Копирует локальную `.codex/memories` в `.codex-shared/memories`.
 - Переименовывает старую локальную `.codex/memories` в backup вида `memories.bak-local-YYYYMMDD-HHMMSS`.
-- Создаёт platform-specific layout для memories.
+- Создаёт ссылку на всю директорию из `.codex/memories` в `.codex-shared/memories`.
 - Не удаляет исходные memories.
 - Не перезаписывает существующую `.codex-shared/memories`.
 
@@ -224,7 +228,7 @@ python codex_shared_onboard.py memories link --apply
 
 - Проверяет, что `.codex-shared/memories` уже существует.
 - Если локальная `.codex/memories` существует, сохраняет её в backup.
-- Создаёт platform-specific layout для memories.
+- Создаёт ссылку на всю директорию из `.codex/memories` в `.codex-shared/memories`.
 - Не копирует локальные reader-memories поверх shared memories.
 
 Для reader-машины в `~/.codex/config.toml`:
@@ -308,7 +312,9 @@ Syncthing не умеет семантически мержить generated memo
 
 ```text
 *sync-conflict*
-*conflict*
+*sync_conflict*
+*conflicted copy*
+delimiter-separated conflict/conflicted markers
 ```
 
 Если такие файлы есть:
@@ -323,7 +329,7 @@ Syncthing не умеет семантически мержить generated memo
 Если нужно откатиться от shared memories:
 
 1. Закройте Codex CLI.
-2. Удалите Windows junction `.codex/memories` или переместите WSL/Linux реальную директорию `.codex/memories` в сторону после удаления её per-entry ссылок.
+2. Удалите саму junction/symlink `.codex/memories`, а не target `.codex-shared/memories`.
 3. Переименуйте нужный backup обратно в `.codex/memories`.
 
 Пример backup:

@@ -14,6 +14,7 @@ import json
 import ntpath
 import os
 import platform
+import re
 import shutil
 import shlex
 import stat
@@ -30,8 +31,64 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.3"
+CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
+MAIN_HELP_EPILOG = f"Run '{APP_NAME} <command> --help' for detailed command behavior."
+DOCTOR_HELP_EPILOG = """Codex analysis behavior:
+  --codex
+    Captures doctor diagnostics and sends them to 'codex exec' for explanation.
+
+  --codex-only
+    Suppresses raw doctor diagnostics and prints only the Codex analysis.
+
+  --codex-read-repo
+    Adds '-C <current-working-directory>' so Codex may read this repository in read-only mode.
+
+  --codex-profile PROFILE
+    Passes '-p PROFILE' to Codex CLI.
+
+  --codex-model MODEL
+    Passes '-m MODEL' to Codex CLI.
+
+  --codex-extra-prompt TEXT
+    Appends extra user instructions to the default English analysis prompt.
+
+Runtime guarantees:
+  Codex is invoked with '--ask-for-approval never exec --ephemeral --sandbox read-only --color never'.
+  On success, only the last Codex message is printed. On failure, transcript output is filtered to error-like lines.
+"""
+INSTALL_HELP_EPILOG = """Install behavior:
+  Creates .codex-shared, .codex-shared/skills-user, and .codex-shared/tools.
+  Writes .codex-shared/.stignore and .codex-shared/memory-policy.md if missing.
+  Links every shared skill directory from .codex-shared/skills-user into .codex/skills.
+  Existing local skills are backed up before replacement when --apply is used.
+"""
+MEMORIES_HELP_EPILOG = """Memory sharing commands:
+  adopt
+    Use on the source/writer machine when local .codex/memories is still the source of truth.
+
+  link
+    Use on additional machines after .codex-shared/memories already exists.
+"""
+MEMORIES_ADOPT_HELP_EPILOG = """Adopt behavior:
+  Requires a real local .codex/memories directory and no existing .codex-shared/memories.
+  Copies local memories to .codex-shared/memories, backs up the original local directory,
+  then links .codex/memories to .codex-shared/memories.
+"""
+MEMORIES_LINK_HELP_EPILOG = """Link behavior:
+  Requires an existing .codex-shared/memories directory.
+  Backs up an existing local .codex/memories directory, then links .codex/memories to shared memories.
+"""
+SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
+  Initializes or reuses a Git repository in .codex-shared and commits the current shared state.
+  Dry-run is the default; use --apply to write the snapshot.
+"""
+INSTALL_CLI_HELP_EPILOG = """Launcher behavior:
+  Installs a codex-shared-onboard wrapper into --bin-dir.
+  On Windows, the launcher is a .cmd file; on Unix-like systems, it is an executable script.
+  PATH is updated when supported unless --no-path-update is set.
+"""
 STIGNORE_TEXT = """(?d)**/__pycache__
 (?d)**/*.pyc
 (?d)**/.pytest_cache
@@ -58,12 +115,10 @@ Rules:
 - Do not silently resolve Syncthing conflict files.
 - If memory conflicts exist, mention them before relying on memory-derived assumptions.
 - Do not manually edit MEMORY.md, memory_summary.md, or raw_memories.md unless explicitly requested.
-- Windows may link .codex/memories to .codex-shared/memories as a junction.
-- WSL/Linux should use a real .codex/memories directory with per-entry symlinks, excluding .git, .agents, and .codex.
+- Link .codex/memories to .codex-shared/memories as a whole directory so Codex-owned internals stay active.
 """
 
 MEMORY_KEY_FILES = ("MEMORY.md", "memory_summary.md", "raw_memories.md")
-MEMORY_LINK_EXCLUDES = {".git", ".agents", ".codex"}
 WINDOWS_PATH_REGISTRY_KEY = "Environment"
 WINDOWS_PATH_VALUE_NAME = "Path"
 
@@ -471,95 +526,13 @@ def verify_memory_link(ctx: Context, link: Path, target: Path) -> bool:
     return False
 
 
-def memory_entry_targets(shared: Path) -> list[Path]:
-    try:
-        entries = list(shared.iterdir())
-    except OSError:
-        return []
-    return [
-        path
-        for path in sorted(entries, key=lambda item: item.name.casefold())
-        if path.name not in MEMORY_LINK_EXCLUDES
-    ]
-
-
-def memory_entry_layout_ok(local: Path, shared: Path) -> bool:
-    if not local.exists() or not local.is_dir() or is_link_like_path(local):
-        return False
-    targets = memory_entry_targets(shared)
-    if not targets:
-        return False
-    target_names = {target.name for target in targets}
-    try:
-        local_entries = list(local.iterdir())
-    except OSError:
-        return False
-    for entry in local_entries:
-        if entry.name not in target_names:
-            return False
-    for target in targets:
-        link = local / target.name
-        if not path_exists_or_link(link) or not same_resolved_path(link, target):
-            return False
-    return True
-
-
-def create_memory_entry_link(ctx: Context, link: Path, target: Path) -> bool:
-    ctx.plan(f"create memory entry symlink {link} -> {target}")
-    if not ctx.apply:
-        return True
-    try:
-        os.symlink(target, link, target_is_directory=target.is_dir())
-    except OSError as exc:
-        ctx.error(f"Failed to create memory entry symlink {link} -> {target}: {exc}")
-        return False
-    return True
-
-
-def create_memory_entry_layout(ctx: Context, local: Path, shared: Path) -> bool:
-    if memory_entry_layout_ok(local, shared):
-        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
-        return True
-    if not ensure_dir(ctx, local):
-        return False
-
-    targets = memory_entry_targets(shared)
-    if not targets:
-        ctx.error(f"Shared memories directory has no linkable entries: {shared}")
-        return False
-
-    for excluded in MEMORY_LINK_EXCLUDES:
-        link = local / excluded
-        if not path_exists_or_link(link):
-            continue
-        ctx.error(f"Local memories must not expose Codex-owned internal entry on WSL/Linux: {link}")
-        return False
-
-    for target in targets:
-        link = local / target.name
-        if path_exists_or_link(link) and same_resolved_path(link, target):
-            continue
-        if path_exists_or_link(link):
-            backup = next_backup_path(link)
-            if not rename_path(ctx, link, backup, "local memory entry to backup"):
-                return False
-        if not create_memory_entry_link(ctx, link, target):
-            return False
-    if ctx.apply and not memory_entry_layout_ok(local, shared):
-        ctx.error(f"Memory entry layout verification failed: {local} does not match {shared}")
-        return False
-    return True
-
-
 def create_memory_layout(ctx: Context, local: Path, shared: Path) -> bool:
-    if is_windows():
-        if path_exists_or_link(local) and same_resolved_path(local, shared):
-            ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
-            return True
-        if not create_directory_link(ctx, local, shared):
-            return False
-        return verify_memory_link(ctx, local, shared)
-    return create_memory_entry_layout(ctx, local, shared)
+    if path_exists_or_link(local) and same_resolved_path(local, shared):
+        ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
+        return True
+    if not create_directory_link(ctx, local, shared):
+        return False
+    return verify_memory_link(ctx, local, shared)
 
 
 def warn_memory_key_files(ctx: Context, root: Path, label: str) -> None:
@@ -569,15 +542,135 @@ def warn_memory_key_files(ctx: Context, root: Path, label: str) -> None:
         ctx.warn(f"{label} is missing common Codex memory file: {root / name}")
 
 
+def build_codex_doctor_prompt(doctor_output: str, extra_prompt: str | None) -> str:
+    parts = [
+        "You are analyzing diagnostics from codex-shared-onboard.",
+        "",
+        "This is a read-only diagnostic pass. Do not modify files. Do not ask to run commands. "
+        "Do not claim hidden state that is not present in the diagnostics. Clearly separate facts from inferences.",
+        "",
+        "Explain the current .codex/.codex-shared state from the doctor output below. Focus on:",
+        "- errors that require action",
+        "- warnings and whether they are expected",
+        "- memory linking state",
+        "- shared skills linking state",
+        "- Syncthing/tool availability",
+        "- practical next steps",
+        "",
+        "Keep the answer concise.",
+    ]
+    if extra_prompt:
+        parts.extend(["", "Additional user instructions:", extra_prompt])
+    parts.extend(["", "Doctor output:", "```text", doctor_output.rstrip(), "```", ""])
+    return "\n".join(parts)
+
+
+def build_codex_doctor_command(
+    args: argparse.Namespace,
+    cwd: Path,
+    codex_executable: str = "codex",
+    output_path: Path | None = None,
+) -> list[str]:
+    command = [
+        codex_executable,
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+    ]
+    if output_path is not None:
+        command.extend(["--output-last-message", str(output_path)])
+    if args.codex_profile:
+        command.extend(["-p", args.codex_profile])
+    if args.codex_model:
+        command.extend(["-m", args.codex_model])
+    if args.codex_read_repo:
+        command.extend(["-C", str(cwd)])
+    command.append("-")
+    return command
+
+
+def extract_codex_failure_output(stdout: str) -> str:
+    lines: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        lowered = stripped.casefold()
+        is_codex_log = " error " in lowered and ("codex" in lowered or "api" in lowered)
+        is_error_line = stripped.startswith(("ERROR", "[ERROR]"))
+        is_network_error = any(
+            marker in lowered
+            for marker in (
+                "http error",
+                "unauthorized",
+                "forbidden",
+                "failed to connect",
+                "stream disconnected",
+                "error sending request",
+            )
+        )
+        if is_codex_log or is_error_line or is_network_error:
+            lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    tail = stdout.splitlines()[-20:]
+    return "\n".join(tail)
+
+
+def run_codex_doctor_analysis(ctx: Context, args: argparse.Namespace, doctor_output: str) -> int:
+    codex_executable = tool_path("codex")
+    if codex_executable is None:
+        ctx.error("codex executable is missing; install Codex CLI or remove --codex.")
+        return 1
+
+    prompt = build_codex_doctor_prompt(doctor_output, args.codex_extra_prompt)
+    output_file: Path | None = None
+    try:
+        output_fd, output_name = tempfile.mkstemp(prefix="codex-doctor-", suffix=".txt")
+        os.close(output_fd)
+        output_file = Path(output_name)
+        command = build_codex_doctor_command(args, Path.cwd(), codex_executable, output_file)
+        if ctx.verbose:
+            ctx.info(f"run: {' '.join(shlex.quote(part) for part in command)}")
+        result = subprocess.run(command, input=prompt, text=True, capture_output=True, check=False)
+    except OSError as exc:
+        ctx.error(f"Failed to run codex exec: {exc}")
+        return 1
+
+    try:
+        if result.returncode == 0:
+            final_message = ""
+            if output_file and output_file.is_file():
+                final_message = output_file.read_text(encoding="utf-8", errors="replace")
+            if final_message:
+                print(final_message, end="" if final_message.endswith("\n") else "\n")
+            elif result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            return 0
+
+        combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        failure_output = extract_codex_failure_output(combined_output)
+        if failure_output:
+            print(failure_output, end="" if failure_output.endswith("\n") else "\n")
+        ctx.error(f"codex exec failed with exit code {result.returncode}")
+        return 1
+    finally:
+        if output_file is not None:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+
+
 def command_memories_adopt(ctx: Context) -> int:
     local = ctx.memories_dir
     shared = ctx.shared_memories_dir
 
-    if is_windows() and path_exists_or_link(local) and same_resolved_path(local, shared):
+    if path_exists_or_link(local) and same_resolved_path(local, shared):
         ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
-        return 0
-    if not is_windows() and memory_entry_layout_ok(local, shared):
-        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
         return 0
 
     if not local.exists() or not local.is_dir() or is_link_like_path(local):
@@ -598,9 +691,6 @@ def command_memories_adopt(ctx: Context) -> int:
         return 1
     if not rename_path(ctx, local, backup, "local memories to backup"):
         return 1
-    if not ctx.apply and not is_windows():
-        ctx.plan(f"create per-entry memory layout {local} -> {shared}")
-        return 1 if ctx.errors else 0
     if not create_memory_layout(ctx, local, shared):
         if ctx.apply and not path_exists_or_link(local) and backup.exists():
             try:
@@ -621,11 +711,8 @@ def command_memories_link(ctx: Context) -> int:
         return 1
     if not validate_no_conflicts(ctx, shared, "shared memories"):
         return 1
-    if is_windows() and path_exists_or_link(local) and same_resolved_path(local, shared):
+    if path_exists_or_link(local) and same_resolved_path(local, shared):
         ctx.info(f"Local memories already point to shared memories: {local} -> {shared}")
-        return 0
-    if not is_windows() and memory_entry_layout_ok(local, shared):
-        ctx.info(f"Local memories already use per-entry shared layout: {local} -> {shared}")
         return 0
     if not ensure_dir(ctx, ctx.codex_dir):
         return 1
@@ -689,7 +776,12 @@ def prepare_shared_layout(ctx: Context) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Prepare Codex shared skills and diagnostics.")
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Prepare Codex shared skills and diagnostics.",
+        epilog=MAIN_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
@@ -699,19 +791,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--syncthing-api-key", default=None)
 
     sub = parser.add_subparsers(dest="command", required=True)
-    install = sub.add_parser("install", help="Prepare shared folder and link shared user skills.")
+    install = sub.add_parser(
+        "install",
+        help="Prepare shared folder and link shared user skills. Options: --apply, --configure-syncthing.",
+        description="Prepare .codex-shared and link shared user skills into .codex/skills.",
+        epilog=INSTALL_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install.add_argument("--configure-syncthing", action="store_true")
-    sub.add_parser("doctor", help="Diagnose shared Codex setup.")
-    snapshot = sub.add_parser("snapshot", help="Create a local Git snapshot of .codex-shared.")
+    install.add_argument("--configure-syncthing", action="store_true", help="Try to add .codex-shared to the local Syncthing configuration.")
+    doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose shared Codex setup. Options: --codex, --codex-only, --codex-read-repo, --codex-profile, --codex-model, --codex-extra-prompt.",
+        description="Diagnose .codex/.codex-shared links, memories, shared skills, Git, and Syncthing availability.",
+        epilog=DOCTOR_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor.add_argument("--codex", action="store_true", help="Ask Codex CLI to explain the captured diagnostics.")
+    doctor.add_argument("--codex-only", action="store_true", help="Print only Codex analysis, suppressing raw doctor output.")
+    doctor.add_argument("--codex-read-repo", action="store_true", help="Allow Codex analysis to read this repository in read-only mode.")
+    doctor.add_argument("--codex-profile", default=None, help="Codex config profile to pass to 'codex exec'.")
+    doctor.add_argument("--codex-model", default=None, help="Codex model to pass to 'codex exec'.")
+    doctor.add_argument("--codex-extra-prompt", default=None, help="Extra instructions appended to the Codex analysis prompt.")
+    snapshot = sub.add_parser(
+        "snapshot",
+        help="Create a local Git snapshot of .codex-shared. Options: --apply.",
+        description="Create a local Git snapshot of .codex-shared for rollback/history.",
+        epilog=SNAPSHOT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    memories = sub.add_parser("memories", help="Manage Codex memories links between .codex and .codex-shared.")
+    memories = sub.add_parser(
+        "memories",
+        help="Manage Codex memories links between .codex and .codex-shared. Subcommands: adopt --apply, link --apply.",
+        description="Manage Codex memories as a whole-directory shared link.",
+        epilog=MEMORIES_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     memories_sub = memories.add_subparsers(dest="memories_command", required=True)
-    adopt = memories_sub.add_parser("adopt", help="Make the current local memories directory the shared source.")
+    adopt = memories_sub.add_parser(
+        "adopt",
+        help="Make the current local memories directory the shared source.",
+        description="Adopt the current real local .codex/memories directory as .codex-shared/memories.",
+        epilog=MEMORIES_ADOPT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     adopt.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    link = memories_sub.add_parser("link", help="Link local memories to an existing shared memories directory.")
+    link = memories_sub.add_parser(
+        "link",
+        help="Link local memories to an existing shared memories directory.",
+        description="Link local .codex/memories to an existing .codex-shared/memories directory.",
+        epilog=MEMORIES_LINK_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install_cli = sub.add_parser("install-cli", help=f"Install a local '{APP_NAME}' launcher.")
+    install_cli = sub.add_parser(
+        "install-cli",
+        help=f"Install a local '{APP_NAME}' launcher. Options: --apply, --bin-dir, --force, --no-path-update.",
+        description=f"Install or update a local '{APP_NAME}' command launcher.",
+        epilog=INSTALL_CLI_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install_cli.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
     install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
@@ -1026,6 +1166,14 @@ def command_install_cli(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def find_conflict_files(root: Path) -> list[Path]:
+    def is_conflict_filename(filename: str) -> bool:
+        name = filename.casefold()
+        if "sync-conflict" in name or "sync_conflict" in name:
+            return True
+        if "conflicted copy" in name or "conflicted-copy" in name:
+            return True
+        return bool(re.search(r"(^|[._ -])conflicted?([._ -]|$)", name))
+
     def is_link_like_dir(path: Path) -> bool:
         try:
             if path.is_symlink():
@@ -1055,8 +1203,7 @@ def find_conflict_files(root: Path) -> list[Path]:
         dirnames[:] = kept_dirs
 
         for filename in filenames:
-            name = filename.casefold()
-            if "sync-conflict" not in name and "conflict" not in name:
+            if not is_conflict_filename(filename):
                 continue
             path = current_path / filename
             try:
@@ -1071,7 +1218,7 @@ def tool_path(name: str) -> str | None:
     return shutil.which(name)
 
 
-def command_doctor(ctx: Context) -> int:
+def print_doctor_diagnostics(ctx: Context) -> int:
     print(f"platform={platform.platform()}")
     print(f"is_windows={is_windows()}")
     print(f"is_wsl={is_wsl()}")
@@ -1106,17 +1253,12 @@ def command_doctor(ctx: Context) -> int:
     shared_memories = ctx.shared_memories_dir
     if not path_exists_or_link(local_memories):
         ctx.warn(f"Local memories path is missing: {local_memories}")
-    elif is_windows():
-        if shared_memories.exists() and same_resolved_path(local_memories, shared_memories):
-            print(f"memories=linked local={local_memories} shared={shared_memories}")
-        else:
-            ctx.warn(f"Local memories are not linked to shared memories: {local_memories}")
-    elif is_link_like_path(local_memories):
-        ctx.warn(f"Local memories should be a real directory on WSL/Linux, not a whole-directory link: {local_memories}")
-    elif shared_memories.exists() and memory_entry_layout_ok(local_memories, shared_memories):
-        print(f"memories=per-entry-linked local={local_memories} shared={shared_memories}")
+    elif shared_memories.exists() and same_resolved_path(local_memories, shared_memories):
+        print(f"memories=linked local={local_memories} shared={shared_memories}")
+        if not is_windows() and is_link_like_path(local_memories):
+            ctx.warn("WSL/Linux whole-directory memory symlink preserves Codex internals but may trigger sandbox issues.")
     elif shared_memories.exists():
-        ctx.warn(f"Local memories do not match the WSL/Linux per-entry shared layout: {local_memories}")
+        ctx.warn(f"Local memories are not linked to shared memories: {local_memories}")
 
     for target in iter_shared_skills(ctx):
         local = ctx.skills_dir / target.name
@@ -1129,6 +1271,26 @@ def command_doctor(ctx: Context) -> int:
             ctx.warn(f"Shared skill is not linked locally: {target} -> {local}")
 
     return 1 if ctx.errors else 0
+
+
+def command_doctor(ctx: Context, args: argparse.Namespace) -> int:
+    if not args.codex:
+        return print_doctor_diagnostics(ctx)
+
+    doctor_stdout = io.StringIO()
+    with contextlib.redirect_stdout(doctor_stdout):
+        doctor_code = print_doctor_diagnostics(ctx)
+    doctor_output = doctor_stdout.getvalue()
+
+    if not args.codex_only:
+        print(doctor_output, end="")
+        if doctor_output and not doctor_output.endswith("\n"):
+            print()
+        print()
+        print(CODEX_ANALYSIS_SEPARATOR)
+
+    codex_code = run_codex_doctor_analysis(ctx, args, doctor_output)
+    return 1 if doctor_code or codex_code else 0
 
 
 def command_version() -> int:
@@ -1338,6 +1500,55 @@ def command_self_test() -> int:
         )
         assert_true(version_command_result.returncode == 0, "version command should return 0")
         assert_true(version_command_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "version command should print app version")
+        root_help_result = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(root_help_result.returncode == 0, "root --help should return 0")
+        root_help_compact = " ".join(root_help_result.stdout.split())
+        assert_true("command reference:" not in root_help_result.stdout, "root --help should not duplicate argparse sections")
+        assert_true("Options: --apply, --configure-syncthing" in root_help_compact, "root --help should show install options in command list")
+        assert_true("Options: --codex, --codex-only" in root_help_compact, "root --help should show doctor options in command list")
+        assert_true("Subcommands: adopt --apply, link --apply" in root_help_compact, "root --help should show memories subcommands in command list")
+        assert_true("install-cli Install a local" in root_help_compact, "root --help should show install-cli command")
+        assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
+        doctor_help_result = subprocess.run(
+            [sys.executable, str(script_path), "doctor", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(doctor_help_result.returncode == 0, "doctor --help should return 0")
+        assert_true("Codex analysis behavior:" in doctor_help_result.stdout, "doctor --help should include Codex behavior reference")
+        assert_true("--codex-read-repo" in doctor_help_result.stdout, "doctor --help should show read-repo option")
+        install_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_help_result.returncode == 0, "install --help should return 0")
+        assert_true("--configure-syncthing" in install_help_result.stdout, "install --help should show Syncthing option")
+        assert_true("Install behavior:" in install_help_result.stdout, "install --help should include behavior reference")
+        memories_help_result = subprocess.run(
+            [sys.executable, str(script_path), "memories", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(memories_help_result.returncode == 0, "memories --help should return 0")
+        assert_true("Memory sharing commands:" in memories_help_result.stdout, "memories --help should include subcommand reference")
+        install_cli_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install-cli", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_cli_help_result.returncode == 0, "install-cli --help should return 0")
+        assert_true("--no-path-update" in install_cli_help_result.stdout, "install-cli --help should show PATH option")
+        assert_true("Launcher behavior:" in install_cli_help_result.stdout, "install-cli --help should include launcher behavior")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
@@ -1353,6 +1564,74 @@ def command_self_test() -> int:
         memories_dir.mkdir()
         conflict_file = memories_dir / "MEMORY.sync-conflict-test.md"
         conflict_file.write_text("conflict\n", encoding="utf-8", newline="\n")
+        false_conflict_file = memories_dir / "branch_conflicts.md"
+        false_conflict_file.write_text("ordinary memory note\n", encoding="utf-8", newline="\n")
+        assert_true(false_conflict_file not in find_conflict_files(shared_dir), "ordinary files mentioning conflicts should not be treated as conflict files")
+
+        fake_bin = case_dir / "fake-bin"
+        fake_bin.mkdir()
+        fake_codex_log = case_dir / "fake-codex-log.json"
+        fake_codex_stdin = case_dir / "fake-codex-stdin.txt"
+        fake_codex_fail = case_dir / "fake-codex-fail"
+        fake_codex_script = fake_bin / "fake_codex.py"
+        fake_codex_script.write_text(
+            "\n".join(
+                [
+                    "import json",
+                    "import sys",
+                    "from pathlib import Path",
+                    f"log_path = Path({str(fake_codex_log)!r})",
+                    f"stdin_path = Path({str(fake_codex_stdin)!r})",
+                    f"fail_path = Path({str(fake_codex_fail)!r})",
+                    "argv = sys.argv[1:]",
+                    "stdin_text = sys.stdin.read()",
+                    "stdin_path.write_text(stdin_text, encoding='utf-8', newline='\\n')",
+                    "log_path.write_text(json.dumps({'argv': argv}, ensure_ascii=False), encoding='utf-8', newline='\\n')",
+                    "if fail_path.exists():",
+                    "    print('SECRET PROMPT SHOULD NOT PRINT')",
+                    "    print('ERROR: fake failure transcript line')",
+                    "    print('SECRET STDERR SHOULD NOT PRINT', file=sys.stderr)",
+                    "    print('ERROR: FAKE CODEX FAILURE', file=sys.stderr)",
+                    "    raise SystemExit(7)",
+                    "analysis = 'FAKE CODEX ANALYSIS\\n'",
+                    "for index, value in enumerate(argv[:-1]):",
+                    "    if value in ('-o', '--output-last-message'):",
+                    "        Path(argv[index + 1]).write_text(analysis, encoding='utf-8', newline='\\n')",
+                    "        break",
+                    "print('FAKE CODEX TRANSCRIPT')",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        if is_windows():
+            fake_codex = fake_bin / "codex.cmd"
+            fake_codex.write_text(
+                f'@echo off\r\n"{sys.executable}" "{fake_codex_script}" %*\r\n',
+                encoding="utf-8",
+                newline="",
+            )
+        else:
+            fake_codex = fake_bin / "codex"
+            fake_codex.write_text(
+                f"#!{sys.executable}\n"
+                f"exec(open({str(fake_codex_script)!r}, encoding='utf-8').read())\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_codex.chmod(0o755)
+
+        def run_script_with_fake_codex(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), *arguments],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
 
         doctor_stdout = io.StringIO()
         with contextlib.redirect_stdout(doctor_stdout):
@@ -1372,12 +1651,105 @@ def command_self_test() -> int:
             "doctor should report the conflict file",
         )
 
+        codex_result = run_script_with_fake_codex(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "doctor",
+                "--codex",
+                "--codex-extra-prompt",
+                "Answer in Russian.",
+            ]
+        )
+        assert_true(
+            codex_result.returncode == 0,
+            f"doctor --codex should return 0 with fake Codex, got {codex_result.returncode}; stdout={codex_result.stdout!r}; stderr={codex_result.stderr!r}",
+        )
+        assert_true(CODEX_ANALYSIS_SEPARATOR in codex_result.stdout, "doctor --codex should print analysis separator")
+        assert_true("FAKE CODEX ANALYSIS" in codex_result.stdout, "doctor --codex should print fake Codex output")
+        assert_true("FAKE CODEX TRANSCRIPT" not in codex_result.stdout, "doctor --codex should print final Codex message, not transcript stdout")
+        assert_true("platform=" in codex_result.stdout, "doctor --codex should print raw doctor output by default")
+
+        fake_argv = json.loads(fake_codex_log.read_text(encoding="utf-8"))["argv"]
+        assert_true(fake_argv[:4] == ["--ask-for-approval", "never", "exec", "--ephemeral"], "doctor --codex should use codex exec --ephemeral with global approval policy")
+        assert_true("--sandbox" in fake_argv and "read-only" in fake_argv, "doctor --codex should use read-only sandbox")
+        assert_true("--color" in fake_argv and "never" in fake_argv, "doctor --codex should disable Codex output color")
+        assert_true("--output-last-message" in fake_argv, "doctor --codex should request final message output")
+        assert_true("--ask-for-approval" in fake_argv and "never" in fake_argv, "doctor --codex should never request approval")
+        assert_true(fake_argv[-1] == "-", "doctor --codex should pass prompt through stdin")
+        fake_stdin = fake_codex_stdin.read_text(encoding="utf-8")
+        assert_true("Doctor output:" in fake_stdin, "doctor --codex prompt should include doctor output section")
+        assert_true("Answer in Russian." in fake_stdin, "doctor --codex prompt should include extra prompt")
+        assert_true("platform=" in fake_stdin, "doctor --codex prompt should include captured diagnostics")
+
+        codex_only_result = run_script_with_fake_codex(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "doctor",
+                "--codex",
+                "--codex-only",
+            ]
+        )
+        assert_true(codex_only_result.returncode == 0, "doctor --codex-only should return 0 with fake Codex")
+        assert_true("FAKE CODEX ANALYSIS" in codex_only_result.stdout, "doctor --codex-only should print analysis")
+        assert_true("platform=" not in codex_only_result.stdout, "doctor --codex-only should suppress raw doctor output")
+
+        codex_options_result = run_script_with_fake_codex(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "doctor",
+                "--codex",
+                "--codex-only",
+                "--codex-read-repo",
+                "--codex-profile",
+                "profile-test",
+                "--codex-model",
+                "model-test",
+            ]
+        )
+        assert_true(codex_options_result.returncode == 0, "doctor --codex should pass optional Codex flags")
+        fake_argv = json.loads(fake_codex_log.read_text(encoding="utf-8"))["argv"]
+        assert_true("-C" in fake_argv and str(Path.cwd()) in fake_argv, "doctor --codex-read-repo should pass repository root")
+        assert_true("-p" in fake_argv and "profile-test" in fake_argv, "doctor --codex-profile should pass profile")
+        assert_true("-m" in fake_argv and "model-test" in fake_argv, "doctor --codex-model should pass model")
+
+        fake_codex_fail.write_text("fail\n", encoding="utf-8", newline="\n")
+        failing_codex_result = run_script_with_fake_codex(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "doctor",
+                "--codex",
+                "--codex-only",
+            ]
+        )
+        assert_true(failing_codex_result.returncode != 0, "doctor --codex should fail when codex exec fails")
+        assert_true("codex exec failed with exit code" in failing_codex_result.stdout, "doctor --codex should report Codex exit code")
+        assert_true("ERROR: fake failure transcript line" in failing_codex_result.stdout, "doctor --codex should keep error-like Codex stdout lines")
+        assert_true("ERROR: FAKE CODEX FAILURE" in failing_codex_result.stdout, "doctor --codex should keep error-like Codex stderr lines")
+        assert_true("SECRET PROMPT SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex transcript")
+        assert_true("SECRET STDERR SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex stderr transcript")
+        fake_codex_fail.unlink()
+
         adopt_case = case_dir / "memories-adopt"
         adopt_codex = adopt_case / ".codex"
         adopt_shared = adopt_case / ".codex-shared"
         adopt_local_memories = adopt_codex / "memories"
         adopt_shared_memories = adopt_shared / "memories"
         adopt_local_memories.mkdir(parents=True)
+        (adopt_local_memories / ".git").mkdir()
+        (adopt_local_memories / ".agents").mkdir()
+        (adopt_local_memories / ".codex").write_text("codex internal marker\n", encoding="utf-8", newline="\n")
         (adopt_local_memories / "MEMORY.md").write_text("local writer memory\n", encoding="utf-8", newline="\n")
 
         adopt_dry_run_code = run_script(
@@ -1407,10 +1779,10 @@ def command_self_test() -> int:
         )
         assert_true(adopt_apply_code == 0, "apply memories adopt should return 0")
         assert_true((adopt_shared_memories / "MEMORY.md").read_text(encoding="utf-8") == "local writer memory\n", "adopt should copy local memories into shared")
-        if is_windows():
-            assert_true(same_resolved_path(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through local path")
-        else:
-            assert_true(memory_entry_layout_ok(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through per-entry layout")
+        assert_true(same_resolved_path(adopt_local_memories, adopt_shared_memories), "adopt should expose shared memories through local path")
+        assert_true((adopt_local_memories / ".git").is_dir(), "adopt should keep .git active through the local memory link")
+        assert_true((adopt_local_memories / ".agents").is_dir(), "adopt should keep .agents active through the local memory link")
+        assert_true((adopt_local_memories / ".codex").is_file(), "adopt should keep .codex active through the local memory link")
         adopt_backups = sorted(adopt_codex.glob("memories.bak-local-*"))
         assert_true(len(adopt_backups) == 1, "adopt should backup original local memories")
         assert_true((adopt_backups[0] / "MEMORY.md").read_text(encoding="utf-8") == "local writer memory\n", "adopt backup should keep original local memories")
@@ -1422,6 +1794,9 @@ def command_self_test() -> int:
         link_shared_memories = link_shared / "memories"
         link_local_memories.mkdir(parents=True)
         link_shared_memories.mkdir(parents=True)
+        (link_shared_memories / ".git").mkdir()
+        (link_shared_memories / ".agents").mkdir()
+        (link_shared_memories / ".codex").write_text("codex internal marker\n", encoding="utf-8", newline="\n")
         (link_local_memories / "MEMORY.md").write_text("reader-local memory\n", encoding="utf-8", newline="\n")
         (link_shared_memories / "MEMORY.md").write_text("shared memory\n", encoding="utf-8", newline="\n")
 
@@ -1437,38 +1812,14 @@ def command_self_test() -> int:
             ]
         )
         assert_true(link_apply_code == 0, "apply memories link should return 0")
-        if is_windows():
-            assert_true(same_resolved_path(link_local_memories, link_shared_memories), "link should expose shared memories through local path")
-        else:
-            assert_true(memory_entry_layout_ok(link_local_memories, link_shared_memories), "link should expose shared memories through per-entry layout")
+        assert_true(same_resolved_path(link_local_memories, link_shared_memories), "link should expose shared memories through local path")
+        assert_true((link_local_memories / ".git").is_dir(), "link should keep .git active through the local memory link")
+        assert_true((link_local_memories / ".agents").is_dir(), "link should keep .agents active through the local memory link")
+        assert_true((link_local_memories / ".codex").is_file(), "link should keep .codex active through the local memory link")
         assert_true((link_local_memories / "MEMORY.md").read_text(encoding="utf-8") == "shared memory\n", "link should not overwrite shared memories")
         link_backups = sorted(link_codex.glob("memories.bak-local-*"))
         assert_true(len(link_backups) == 1, "link should backup existing local memories")
         assert_true((link_backups[0] / "MEMORY.md").read_text(encoding="utf-8") == "reader-local memory\n", "link backup should keep original reader memories")
-
-        entry_layout_shared = case_dir / "memory-entry-layout" / ".codex-shared" / "memories"
-        for name in ("rollout_summaries", "extensions", ".git", ".agents"):
-            (entry_layout_shared / name).mkdir(parents=True)
-        for name in ("MEMORY.md", "memory_summary.md", "raw_memories.md", ".codex"):
-            (entry_layout_shared / name).write_text(f"{name}\n", encoding="utf-8", newline="\n")
-        entry_names = [path.name for path in memory_entry_targets(entry_layout_shared)]
-        assert_true(".git" not in entry_names, "WSL/Linux memory entry layout must exclude .git")
-        assert_true(".agents" not in entry_names, "WSL/Linux memory entry layout must exclude .agents")
-        assert_true(".codex" not in entry_names, "WSL/Linux memory entry layout must exclude .codex marker")
-        assert_true("MEMORY.md" in entry_names, "WSL/Linux memory entry layout should include MEMORY.md")
-        assert_true("rollout_summaries" in entry_names, "WSL/Linux memory entry layout should include rollout_summaries")
-        assert_true("extensions" in entry_names, "WSL/Linux memory entry layout should include extensions")
-        if not is_windows():
-            entry_layout_local = case_dir / "memory-entry-layout" / ".codex" / "memories"
-            entry_layout_ctx = Context(case_dir / "memory-entry-layout" / ".codex", case_dir / "memory-entry-layout" / ".codex-shared", apply=True)
-            assert_true(create_memory_entry_layout(entry_layout_ctx, entry_layout_local, entry_layout_shared), "WSL/Linux memory entry layout should be created")
-            assert_true(not path_exists_or_link(entry_layout_local / ".git"), "WSL/Linux memory entry layout must not link .git")
-            assert_true(not path_exists_or_link(entry_layout_local / ".agents"), "WSL/Linux memory entry layout must not link .agents")
-            assert_true(not path_exists_or_link(entry_layout_local / ".codex"), "WSL/Linux memory entry layout must not link .codex marker")
-            assert_true(same_resolved_path(entry_layout_local / "MEMORY.md", entry_layout_shared / "MEMORY.md"), "WSL/Linux MEMORY.md should resolve to shared file")
-            assert_true(same_resolved_path(entry_layout_local / "extensions", entry_layout_shared / "extensions"), "WSL/Linux extensions should resolve to shared directory")
-            (entry_layout_local / "stale-local.md").write_text("stale\n", encoding="utf-8", newline="\n")
-            assert_true(not memory_entry_layout_ok(entry_layout_local, entry_layout_shared), "WSL/Linux memory entry layout should reject stale local-only entries")
 
         stub_case = case_dir / "link-stub"
         stub_link = stub_case / "local-link"
@@ -1508,7 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         return command_install(ctx, configure_syncthing=args.configure_syncthing, args=args)
     if args.command == "doctor":
-        return command_doctor(ctx)
+        return command_doctor(ctx, args)
     if args.command == "snapshot":
         return command_snapshot(ctx)
     if args.command == "install-cli":

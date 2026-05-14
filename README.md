@@ -57,7 +57,7 @@ Commands:
 install                     Prepare .codex-shared and link shared user skills into .codex/skills.
 doctor                      Diagnose paths, tools, shared files, memory layout, conflicts, and skill links.
 snapshot                    Create a local Git snapshot of .codex-shared.
-memories adopt              Copy local .codex/memories into .codex-shared/memories and switch local memories to the platform-specific shared layout.
+memories adopt              Copy local .codex/memories into .codex-shared/memories and link local memories to the shared directory.
 memories link               Connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
 install-cli                 Install a local codex-shared-onboard launcher.
 version                     Print the tool version.
@@ -70,6 +70,14 @@ Command options:
 install --apply             Apply install changes. Without it, print the planned changes only.
 install --configure-syncthing
                             Try to register .codex-shared in local Syncthing through the REST API.
+
+doctor --codex             Ask Codex CLI to explain captured diagnostics.
+doctor --codex-only        Print only Codex analysis, suppressing raw doctor output.
+doctor --codex-read-repo   Allow read-only repository inspection during Codex analysis.
+doctor --codex-profile P   Pass a Codex config profile to codex exec.
+doctor --codex-model M     Pass a Codex model to codex exec.
+doctor --codex-extra-prompt TEXT
+                            Append extra instructions to the Codex analysis prompt.
 
 snapshot --apply            Initialize/use Git in .codex-shared and commit the current shared state.
 
@@ -87,6 +95,8 @@ Dry-run examples:
 
 ```bash
 python codex_shared_onboard.py install
+python codex_shared_onboard.py doctor --codex
+python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
 python codex_shared_onboard.py memories link
 python codex_shared_onboard.py snapshot
 ```
@@ -153,23 +163,17 @@ Local `.codex` consumes shared parts through links:
 ~/.codex/skills/<skill> -> ~/.codex-shared/skills-user/<skill>
 ```
 
-Memory linking is platform-specific:
+Memory linking uses a whole-directory link:
 
 ```text
 Windows:
   ~/.codex/memories -> ~/.codex-shared/memories
 
 WSL/Linux:
-  ~/.codex/memories/                  real local directory
-  ~/.codex/memories/MEMORY.md         -> ~/.codex-shared/memories/MEMORY.md
-  ~/.codex/memories/memory_summary.md -> ~/.codex-shared/memories/memory_summary.md
-  ~/.codex/memories/raw_memories.md   -> ~/.codex-shared/memories/raw_memories.md
-  ~/.codex/memories/rollout_summaries -> ~/.codex-shared/memories/rollout_summaries
-  ~/.codex/memories/extensions        -> ~/.codex-shared/memories/extensions
-  plus any other non-internal top-level memory artifacts
+  ~/.codex/memories -> ~/.codex-shared/memories
 ```
 
-WSL/Linux intentionally does not link `.git`, `.agents`, or `.codex` from shared memories. A whole-directory symlink can break Codex sandboxing when shared memories contain Codex-owned internal state.
+This keeps Codex-owned memory internals such as `.git`, `.agents`, and `.codex` active under the local `~/.codex/memories` path. On WSL/Linux, this whole-directory symlink can trigger Codex sandbox/bubblewrap issues when the shared path crosses into `/mnt/c`. If that happens, do not delete `.git`; inspect the layout and decide manually.
 
 ## First Machine / Writer
 
@@ -188,7 +192,7 @@ python codex_shared_onboard.py memories adopt --apply
 
 - Copies local `.codex/memories` into `.codex-shared/memories`.
 - Renames the old local `.codex/memories` to `memories.bak-local-YYYYMMDD-HHMMSS`.
-- Creates the platform-specific memory layout.
+- Creates a whole-directory link from `.codex/memories` to `.codex-shared/memories`.
 - Does not delete the original memories.
 - Does not overwrite an existing `.codex-shared/memories`.
 
@@ -224,7 +228,7 @@ python codex_shared_onboard.py memories link --apply
 
 - Verifies that `.codex-shared/memories` exists.
 - Backs up local `.codex/memories` if it exists.
-- Creates the platform-specific memory layout.
+- Creates a whole-directory link from `.codex/memories` to `.codex-shared/memories`.
 - Does not copy local reader memories over shared memories.
 
 For a reader machine, use this in `~/.codex/config.toml`:
@@ -308,7 +312,9 @@ Before touching shared memories, the script checks for conflict-like files:
 
 ```text
 *sync-conflict*
-*conflict*
+*sync_conflict*
+*conflicted copy*
+delimiter-separated conflict/conflicted markers
 ```
 
 If conflicts exist:
@@ -323,7 +329,7 @@ If conflicts exist:
 To roll back from shared memories:
 
 1. Close Codex CLI.
-2. Remove the Windows `.codex/memories` junction, or move the WSL/Linux real `.codex/memories` directory aside after removing its per-entry links.
+2. Remove the `.codex/memories` junction/symlink itself, not the `.codex-shared/memories` target.
 3. Rename the desired backup back to `.codex/memories`.
 
 Example backup:
