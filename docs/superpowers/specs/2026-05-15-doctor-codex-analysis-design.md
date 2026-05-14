@@ -29,6 +29,12 @@ Default `doctor --codex` output:
 
 `--codex-only` suppresses the raw doctor output and prints only the Codex analysis.
 
+Update both user-facing READMEs during implementation:
+
+- `README.md` must document the new `doctor --codex` flags in the commands/options sections and show one basic example.
+- `README.ru.md` must document the same commands and examples in Russian.
+- These README updates are command documentation, not a roadmap or future-plan section.
+
 ## Codex Invocation
 
 The script runs Codex non-interactively:
