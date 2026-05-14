@@ -71,6 +71,14 @@ install --apply             Применить install-изменения. Бе�
 install --configure-syncthing
                             Попробовать зарегистрировать .codex-shared в локальном Syncthing через REST API.
 
+doctor --codex             Попросить Codex CLI объяснить captured diagnostics.
+doctor --codex-only        Печатать только Codex analysis без raw doctor output.
+doctor --codex-read-repo   Разрешить read-only чтение репозитория во время Codex analysis.
+doctor --codex-profile P   Передать Codex config profile в codex exec.
+doctor --codex-model M     Передать Codex model в codex exec.
+doctor --codex-extra-prompt TEXT
+                            Добавить дополнительные инструкции в Codex analysis prompt.
+
 snapshot --apply            Инициализировать/использовать Git в .codex-shared и закоммитить текущий shared state.
 
 memories adopt --apply      Применить writer adoption. Откажется перезаписывать существующую .codex-shared/memories.
@@ -87,6 +95,8 @@ install-cli --no-path-update
 
 ```bash
 python codex_shared_onboard.py install
+python codex_shared_onboard.py doctor --codex
+python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
 python codex_shared_onboard.py memories link
 python codex_shared_onboard.py snapshot
 ```
