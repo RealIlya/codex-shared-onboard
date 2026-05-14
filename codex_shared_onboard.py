@@ -31,9 +31,28 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
+MAIN_HELP_EPILOG = """examples:
+  codex-shared-onboard install
+  codex-shared-onboard install --apply
+  codex-shared-onboard memories adopt --apply
+  codex-shared-onboard memories link --apply
+  codex-shared-onboard doctor
+  codex-shared-onboard doctor --codex --codex-only
+  codex-shared-onboard doctor --codex --codex-read-repo --codex-extra-prompt "Answer in Russian."
+  codex-shared-onboard install-cli --apply --force
+  codex-shared-onboard version
+"""
+DOCTOR_HELP_EPILOG = """examples:
+  codex-shared-onboard doctor
+  codex-shared-onboard doctor --codex
+  codex-shared-onboard doctor --codex --codex-only
+  codex-shared-onboard doctor --codex --codex-read-repo
+  codex-shared-onboard doctor --codex --codex-profile writer --codex-model gpt-5.5
+  codex-shared-onboard doctor --codex --codex-extra-prompt "Answer in Russian. Keep it to 5 bullets."
+"""
 STIGNORE_TEXT = """(?d)**/__pycache__
 (?d)**/*.pyc
 (?d)**/.pytest_cache
@@ -721,7 +740,12 @@ def prepare_shared_layout(ctx: Context) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Prepare Codex shared skills and diagnostics.")
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Prepare Codex shared skills and diagnostics.",
+        epilog=MAIN_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
@@ -734,7 +758,12 @@ def build_parser() -> argparse.ArgumentParser:
     install = sub.add_parser("install", help="Prepare shared folder and link shared user skills.")
     install.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install.add_argument("--configure-syncthing", action="store_true")
-    doctor = sub.add_parser("doctor", help="Diagnose shared Codex setup.")
+    doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose shared Codex setup.",
+        epilog=DOCTOR_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     doctor.add_argument("--codex", action="store_true", help="Ask Codex CLI to explain the captured diagnostics.")
     doctor.add_argument("--codex-only", action="store_true", help="Print only Codex analysis, suppressing raw doctor output.")
     doctor.add_argument("--codex-read-repo", action="store_true", help="Allow Codex analysis to read this repository in read-only mode.")
@@ -1398,6 +1427,24 @@ def command_self_test() -> int:
         )
         assert_true(version_command_result.returncode == 0, "version command should return 0")
         assert_true(version_command_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "version command should print app version")
+        root_help_result = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(root_help_result.returncode == 0, "root --help should return 0")
+        assert_true("codex-shared-onboard doctor --codex --codex-only" in root_help_result.stdout, "root --help should show doctor Codex example")
+        assert_true("codex-shared-onboard memories adopt --apply" in root_help_result.stdout, "root --help should show memories adopt example")
+        doctor_help_result = subprocess.run(
+            [sys.executable, str(script_path), "doctor", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(doctor_help_result.returncode == 0, "doctor --help should return 0")
+        assert_true("codex-shared-onboard doctor --codex --codex-extra-prompt" in doctor_help_result.stdout, "doctor --help should show extra prompt example")
+        assert_true("--codex-read-repo" in doctor_help_result.stdout, "doctor --help should show read-repo option")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
