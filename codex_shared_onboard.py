@@ -31,27 +31,99 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
-MAIN_HELP_EPILOG = """examples:
-  codex-shared-onboard install
-  codex-shared-onboard install --apply
-  codex-shared-onboard memories adopt --apply
-  codex-shared-onboard memories link --apply
-  codex-shared-onboard doctor
-  codex-shared-onboard doctor --codex --codex-only
-  codex-shared-onboard doctor --codex --codex-read-repo --codex-extra-prompt "Answer in Russian."
-  codex-shared-onboard install-cli --apply --force
-  codex-shared-onboard version
+MAIN_HELP_EPILOG = """command reference:
+  Global options:
+    --codex-dir PATH                 Codex home directory to inspect or modify.
+    --shared-dir PATH                Shared .codex-shared directory.
+    --apply                          Execute filesystem changes. Without it, commands are dry-run.
+    --verbose                        Print additional command/runtime details.
+    --syncthing-url URL              Syncthing REST API URL for install --configure-syncthing.
+    --syncthing-api-key KEY          Syncthing API key. If omitted, config.xml is inspected when possible.
+
+  Commands:
+    install [--apply] [--configure-syncthing]
+      Prepare .codex-shared, write shared policy files, and link shared user skills into .codex/skills.
+
+    doctor [--codex] [--codex-only] [--codex-read-repo]
+           [--codex-profile PROFILE] [--codex-model MODEL]
+           [--codex-extra-prompt TEXT]
+      Diagnose local .codex/.codex-shared state. Optionally pass diagnostics to Codex CLI.
+
+    snapshot [--apply]
+      Create a local Git snapshot in .codex-shared.
+
+    memories adopt [--apply]
+      Copy the current real .codex/memories directory into .codex-shared/memories, back up the local directory,
+      then link .codex/memories to the shared directory. Intended for the writer/source machine.
+
+    memories link [--apply]
+      Link .codex/memories to an existing .codex-shared/memories directory. Intended for reader/additional machines.
+
+    install-cli [--apply] [--bin-dir PATH] [--force] [--no-path-update]
+      Install or update the codex-shared-onboard launcher script.
+
+    version
+      Print the tool version.
+
+    self-test
+      Run built-in tests in temporary folders only.
 """
-DOCTOR_HELP_EPILOG = """examples:
-  codex-shared-onboard doctor
-  codex-shared-onboard doctor --codex
-  codex-shared-onboard doctor --codex --codex-only
-  codex-shared-onboard doctor --codex --codex-read-repo
-  codex-shared-onboard doctor --codex --codex-profile writer --codex-model gpt-5.5
-  codex-shared-onboard doctor --codex --codex-extra-prompt "Answer in Russian. Keep it to 5 bullets."
+DOCTOR_HELP_EPILOG = """Codex analysis behavior:
+  --codex
+    Captures doctor diagnostics and sends them to 'codex exec' for explanation.
+
+  --codex-only
+    Suppresses raw doctor diagnostics and prints only the Codex analysis.
+
+  --codex-read-repo
+    Adds '-C <current-working-directory>' so Codex may read this repository in read-only mode.
+
+  --codex-profile PROFILE
+    Passes '-p PROFILE' to Codex CLI.
+
+  --codex-model MODEL
+    Passes '-m MODEL' to Codex CLI.
+
+  --codex-extra-prompt TEXT
+    Appends extra user instructions to the default English analysis prompt.
+
+Runtime guarantees:
+  Codex is invoked with '--ask-for-approval never exec --ephemeral --sandbox read-only --color never'.
+  On success, only the last Codex message is printed. On failure, transcript output is filtered to error-like lines.
+"""
+INSTALL_HELP_EPILOG = """Install behavior:
+  Creates .codex-shared, .codex-shared/skills-user, and .codex-shared/tools.
+  Writes .codex-shared/.stignore and .codex-shared/memory-policy.md if missing.
+  Links every shared skill directory from .codex-shared/skills-user into .codex/skills.
+  Existing local skills are backed up before replacement when --apply is used.
+"""
+MEMORIES_HELP_EPILOG = """Memory sharing commands:
+  adopt
+    Use on the source/writer machine when local .codex/memories is still the source of truth.
+
+  link
+    Use on additional machines after .codex-shared/memories already exists.
+"""
+MEMORIES_ADOPT_HELP_EPILOG = """Adopt behavior:
+  Requires a real local .codex/memories directory and no existing .codex-shared/memories.
+  Copies local memories to .codex-shared/memories, backs up the original local directory,
+  then links .codex/memories to .codex-shared/memories.
+"""
+MEMORIES_LINK_HELP_EPILOG = """Link behavior:
+  Requires an existing .codex-shared/memories directory.
+  Backs up an existing local .codex/memories directory, then links .codex/memories to shared memories.
+"""
+SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
+  Initializes or reuses a Git repository in .codex-shared and commits the current shared state.
+  Dry-run is the default; use --apply to write the snapshot.
+"""
+INSTALL_CLI_HELP_EPILOG = """Launcher behavior:
+  Installs a codex-shared-onboard wrapper into --bin-dir.
+  On Windows, the launcher is a .cmd file; on Unix-like systems, it is an executable script.
+  PATH is updated when supported unless --no-path-update is set.
 """
 STIGNORE_TEXT = """(?d)**/__pycache__
 (?d)**/*.pyc
@@ -755,12 +827,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--syncthing-api-key", default=None)
 
     sub = parser.add_subparsers(dest="command", required=True)
-    install = sub.add_parser("install", help="Prepare shared folder and link shared user skills.")
+    install = sub.add_parser(
+        "install",
+        help="Prepare shared folder and link shared user skills.",
+        description="Prepare .codex-shared and link shared user skills into .codex/skills.",
+        epilog=INSTALL_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install.add_argument("--configure-syncthing", action="store_true")
+    install.add_argument("--configure-syncthing", action="store_true", help="Try to add .codex-shared to the local Syncthing configuration.")
     doctor = sub.add_parser(
         "doctor",
         help="Diagnose shared Codex setup.",
+        description="Diagnose .codex/.codex-shared links, memories, shared skills, Git, and Syncthing availability.",
         epilog=DOCTOR_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -770,15 +849,45 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--codex-profile", default=None, help="Codex config profile to pass to 'codex exec'.")
     doctor.add_argument("--codex-model", default=None, help="Codex model to pass to 'codex exec'.")
     doctor.add_argument("--codex-extra-prompt", default=None, help="Extra instructions appended to the Codex analysis prompt.")
-    snapshot = sub.add_parser("snapshot", help="Create a local Git snapshot of .codex-shared.")
+    snapshot = sub.add_parser(
+        "snapshot",
+        help="Create a local Git snapshot of .codex-shared.",
+        description="Create a local Git snapshot of .codex-shared for rollback/history.",
+        epilog=SNAPSHOT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    memories = sub.add_parser("memories", help="Manage Codex memories links between .codex and .codex-shared.")
+    memories = sub.add_parser(
+        "memories",
+        help="Manage Codex memories links between .codex and .codex-shared.",
+        description="Manage Codex memories as a whole-directory shared link.",
+        epilog=MEMORIES_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     memories_sub = memories.add_subparsers(dest="memories_command", required=True)
-    adopt = memories_sub.add_parser("adopt", help="Make the current local memories directory the shared source.")
+    adopt = memories_sub.add_parser(
+        "adopt",
+        help="Make the current local memories directory the shared source.",
+        description="Adopt the current real local .codex/memories directory as .codex-shared/memories.",
+        epilog=MEMORIES_ADOPT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     adopt.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    link = memories_sub.add_parser("link", help="Link local memories to an existing shared memories directory.")
+    link = memories_sub.add_parser(
+        "link",
+        help="Link local memories to an existing shared memories directory.",
+        description="Link local .codex/memories to an existing .codex-shared/memories directory.",
+        epilog=MEMORIES_LINK_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install_cli = sub.add_parser("install-cli", help=f"Install a local '{APP_NAME}' launcher.")
+    install_cli = sub.add_parser(
+        "install-cli",
+        help=f"Install a local '{APP_NAME}' launcher.",
+        description=f"Install or update a local '{APP_NAME}' command launcher.",
+        epilog=INSTALL_CLI_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install_cli.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
     install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
@@ -1434,8 +1543,11 @@ def command_self_test() -> int:
             check=False,
         )
         assert_true(root_help_result.returncode == 0, "root --help should return 0")
-        assert_true("codex-shared-onboard doctor --codex --codex-only" in root_help_result.stdout, "root --help should show doctor Codex example")
-        assert_true("codex-shared-onboard memories adopt --apply" in root_help_result.stdout, "root --help should show memories adopt example")
+        assert_true("command reference:" in root_help_result.stdout, "root --help should include command reference")
+        assert_true("install [--apply] [--configure-syncthing]" in root_help_result.stdout, "root --help should describe install options")
+        assert_true("doctor [--codex] [--codex-only] [--codex-read-repo]" in root_help_result.stdout, "root --help should describe doctor options")
+        assert_true("memories adopt [--apply]" in root_help_result.stdout, "root --help should describe memories adopt")
+        assert_true("install-cli [--apply] [--bin-dir PATH] [--force] [--no-path-update]" in root_help_result.stdout, "root --help should describe install-cli options")
         doctor_help_result = subprocess.run(
             [sys.executable, str(script_path), "doctor", "--help"],
             text=True,
@@ -1443,8 +1555,34 @@ def command_self_test() -> int:
             check=False,
         )
         assert_true(doctor_help_result.returncode == 0, "doctor --help should return 0")
-        assert_true("codex-shared-onboard doctor --codex --codex-extra-prompt" in doctor_help_result.stdout, "doctor --help should show extra prompt example")
+        assert_true("Codex analysis behavior:" in doctor_help_result.stdout, "doctor --help should include Codex behavior reference")
         assert_true("--codex-read-repo" in doctor_help_result.stdout, "doctor --help should show read-repo option")
+        install_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_help_result.returncode == 0, "install --help should return 0")
+        assert_true("--configure-syncthing" in install_help_result.stdout, "install --help should show Syncthing option")
+        assert_true("Install behavior:" in install_help_result.stdout, "install --help should include behavior reference")
+        memories_help_result = subprocess.run(
+            [sys.executable, str(script_path), "memories", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(memories_help_result.returncode == 0, "memories --help should return 0")
+        assert_true("Memory sharing commands:" in memories_help_result.stdout, "memories --help should include subcommand reference")
+        install_cli_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install-cli", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_cli_help_result.returncode == 0, "install-cli --help should return 0")
+        assert_true("--no-path-update" in install_cli_help_result.stdout, "install-cli --help should show PATH option")
+        assert_true("Launcher behavior:" in install_cli_help_result.stdout, "install-cli --help should include launcher behavior")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
