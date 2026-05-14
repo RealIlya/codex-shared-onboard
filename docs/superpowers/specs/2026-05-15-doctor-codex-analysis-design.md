@@ -16,6 +16,7 @@ python codex_shared_onboard.py doctor --codex --codex-only
 python codex_shared_onboard.py doctor --codex --codex-read-repo
 python codex_shared_onboard.py doctor --codex --codex-profile PROFILE
 python codex_shared_onboard.py doctor --codex --codex-model MODEL
+python codex_shared_onboard.py doctor --codex --codex-extra-prompt TEXT
 ```
 
 Default `doctor --codex` output:
@@ -52,6 +53,7 @@ Required properties:
 - If `--codex-profile PROFILE` is set, pass `-p PROFILE`.
 - If `--codex-model MODEL` is set, pass `-m MODEL`.
 - If `--codex-read-repo` is set, pass `-C <repository root>`.
+- `--codex-extra-prompt TEXT` is appended to the stdin payload as user-provided analysis preferences.
 
 Without `--codex-read-repo`, Codex receives only the captured diagnostics and the built-in analysis prompt.
 
@@ -64,8 +66,9 @@ The stdin payload contains:
 - instructions to distinguish facts from inferences
 - instructions to provide practical next steps
 - instructions not to claim hidden state or propose destructive changes without explicit user approval
+- optional extra user instructions from `--codex-extra-prompt`
 
-The prompt should ask for concise output in the same language as the surrounding CLI text when possible. The implementation may keep the prompt in English because the diagnostics are technical and path-heavy.
+The built-in prompt is English by default. The script does not infer the user's language. Users can request another language or format through `--codex-extra-prompt`, for example `--codex-extra-prompt "Answer in Russian."`.
 
 ## Data Flow
 
