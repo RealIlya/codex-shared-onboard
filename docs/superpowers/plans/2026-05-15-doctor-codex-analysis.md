@@ -120,16 +120,25 @@ def build_codex_doctor_prompt(doctor_output: str, extra_prompt: str | None) -> s
 Add:
 
 ```python
-def build_codex_doctor_command(args: argparse.Namespace, cwd: Path, codex_executable: str = "codex") -> list[str]:
+def build_codex_doctor_command(
+    args: argparse.Namespace,
+    cwd: Path,
+    codex_executable: str = "codex",
+    output_path: Path | None = None,
+) -> list[str]:
     command = [
         codex_executable,
+        "--ask-for-approval",
+        "never",
         "exec",
         "--ephemeral",
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
+        "--color",
         "never",
     ]
+    if output_path is not None:
+        command.extend(["--output-last-message", str(output_path)])
     if args.codex_profile:
         command.extend(["-p", args.codex_profile])
     if args.codex_model:
@@ -145,6 +154,32 @@ def build_codex_doctor_command(args: argparse.Namespace, cwd: Path, codex_execut
 Add:
 
 ```python
+def extract_codex_failure_output(stdout: str) -> str:
+    lines: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        lowered = stripped.casefold()
+        is_codex_log = " error " in lowered and ("codex" in lowered or "api" in lowered)
+        is_error_line = stripped.startswith(("ERROR", "[ERROR]"))
+        is_network_error = any(
+            marker in lowered
+            for marker in (
+                "http error",
+                "unauthorized",
+                "forbidden",
+                "failed to connect",
+                "stream disconnected",
+                "error sending request",
+            )
+        )
+        if is_codex_log or is_error_line or is_network_error:
+            lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    tail = stdout.splitlines()[-20:]
+    return "\n".join(tail)
+
+
 def run_codex_doctor_analysis(ctx: Context, args: argparse.Namespace, doctor_output: str) -> int:
     codex_executable = tool_path("codex")
     if codex_executable is None:
@@ -152,23 +187,42 @@ def run_codex_doctor_analysis(ctx: Context, args: argparse.Namespace, doctor_out
         return 1
 
     prompt = build_codex_doctor_prompt(doctor_output, args.codex_extra_prompt)
-    command = build_codex_doctor_command(args, Path.cwd(), codex_executable)
-    if ctx.verbose:
-        ctx.info(f"run: {' '.join(shlex.quote(part) for part in command)}")
+    output_file: Path | None = None
     try:
+        output_fd, output_name = tempfile.mkstemp(prefix="codex-doctor-", suffix=".txt")
+        os.close(output_fd)
+        output_file = Path(output_name)
+        command = build_codex_doctor_command(args, Path.cwd(), codex_executable, output_file)
+        if ctx.verbose:
+            ctx.info(f"run: {' '.join(shlex.quote(part) for part in command)}")
         result = subprocess.run(command, input=prompt, text=True, capture_output=True, check=False)
     except OSError as exc:
         ctx.error(f"Failed to run codex exec: {exc}")
         return 1
 
-    if result.stdout:
-        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-    if result.stderr:
-        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
-    if result.returncode != 0:
+    try:
+        if result.returncode == 0:
+            final_message = ""
+            if output_file and output_file.is_file():
+                final_message = output_file.read_text(encoding="utf-8", errors="replace")
+            if final_message:
+                print(final_message, end="" if final_message.endswith("\n") else "\n")
+            elif result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            return 0
+
+        combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        failure_output = extract_codex_failure_output(combined_output)
+        if failure_output:
+            print(failure_output, end="" if failure_output.endswith("\n") else "\n")
         ctx.error(f"codex exec failed with exit code {result.returncode}")
         return 1
-    return 0
+    finally:
+        if output_file is not None:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
 ```
 
 - [ ] **Step 4: Wire the wrapper**
@@ -277,8 +331,10 @@ Read the fake log and assert:
 
 ```python
         fake_argv = json.loads(fake_codex_log.read_text(encoding="utf-8"))["argv"]
-        assert_true(fake_argv[:2] == ["exec", "--ephemeral"], "doctor --codex should use codex exec --ephemeral")
+        assert_true(fake_argv[:4] == ["--ask-for-approval", "never", "exec", "--ephemeral"], "doctor --codex should use codex exec --ephemeral with global approval policy")
         assert_true("--sandbox" in fake_argv and "read-only" in fake_argv, "doctor --codex should use read-only sandbox")
+        assert_true("--color" in fake_argv and "never" in fake_argv, "doctor --codex should disable Codex output color")
+        assert_true("--output-last-message" in fake_argv, "doctor --codex should request final message output")
         assert_true("--ask-for-approval" in fake_argv and "never" in fake_argv, "doctor --codex should never request approval")
         assert_true(fake_argv[-1] == "-", "doctor --codex should pass prompt through stdin")
         fake_stdin = fake_codex_stdin.read_text(encoding="utf-8")

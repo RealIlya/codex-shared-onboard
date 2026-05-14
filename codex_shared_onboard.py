@@ -31,9 +31,64 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.3"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
+MAIN_HELP_EPILOG = f"Run '{APP_NAME} <command> --help' for detailed command behavior."
+DOCTOR_HELP_EPILOG = """Codex analysis behavior:
+  --codex
+    Captures doctor diagnostics and sends them to 'codex exec' for explanation.
+
+  --codex-only
+    Suppresses raw doctor diagnostics and prints only the Codex analysis.
+
+  --codex-read-repo
+    Adds '-C <current-working-directory>' so Codex may read this repository in read-only mode.
+
+  --codex-profile PROFILE
+    Passes '-p PROFILE' to Codex CLI.
+
+  --codex-model MODEL
+    Passes '-m MODEL' to Codex CLI.
+
+  --codex-extra-prompt TEXT
+    Appends extra user instructions to the default English analysis prompt.
+
+Runtime guarantees:
+  Codex is invoked with '--ask-for-approval never exec --ephemeral --sandbox read-only --color never'.
+  On success, only the last Codex message is printed. On failure, transcript output is filtered to error-like lines.
+"""
+INSTALL_HELP_EPILOG = """Install behavior:
+  Creates .codex-shared, .codex-shared/skills-user, and .codex-shared/tools.
+  Writes .codex-shared/.stignore and .codex-shared/memory-policy.md if missing.
+  Links every shared skill directory from .codex-shared/skills-user into .codex/skills.
+  Existing local skills are backed up before replacement when --apply is used.
+"""
+MEMORIES_HELP_EPILOG = """Memory sharing commands:
+  adopt
+    Use on the source/writer machine when local .codex/memories is still the source of truth.
+
+  link
+    Use on additional machines after .codex-shared/memories already exists.
+"""
+MEMORIES_ADOPT_HELP_EPILOG = """Adopt behavior:
+  Requires a real local .codex/memories directory and no existing .codex-shared/memories.
+  Copies local memories to .codex-shared/memories, backs up the original local directory,
+  then links .codex/memories to .codex-shared/memories.
+"""
+MEMORIES_LINK_HELP_EPILOG = """Link behavior:
+  Requires an existing .codex-shared/memories directory.
+  Backs up an existing local .codex/memories directory, then links .codex/memories to shared memories.
+"""
+SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
+  Initializes or reuses a Git repository in .codex-shared and commits the current shared state.
+  Dry-run is the default; use --apply to write the snapshot.
+"""
+INSTALL_CLI_HELP_EPILOG = """Launcher behavior:
+  Installs a codex-shared-onboard wrapper into --bin-dir.
+  On Windows, the launcher is a .cmd file; on Unix-like systems, it is an executable script.
+  PATH is updated when supported unless --no-path-update is set.
+"""
 STIGNORE_TEXT = """(?d)**/__pycache__
 (?d)**/*.pyc
 (?d)**/.pytest_cache
@@ -510,16 +565,25 @@ def build_codex_doctor_prompt(doctor_output: str, extra_prompt: str | None) -> s
     return "\n".join(parts)
 
 
-def build_codex_doctor_command(args: argparse.Namespace, cwd: Path, codex_executable: str = "codex") -> list[str]:
+def build_codex_doctor_command(
+    args: argparse.Namespace,
+    cwd: Path,
+    codex_executable: str = "codex",
+    output_path: Path | None = None,
+) -> list[str]:
     command = [
         codex_executable,
+        "--ask-for-approval",
+        "never",
         "exec",
         "--ephemeral",
         "--sandbox",
         "read-only",
-        "--ask-for-approval",
+        "--color",
         "never",
     ]
+    if output_path is not None:
+        command.extend(["--output-last-message", str(output_path)])
     if args.codex_profile:
         command.extend(["-p", args.codex_profile])
     if args.codex_model:
@@ -530,6 +594,32 @@ def build_codex_doctor_command(args: argparse.Namespace, cwd: Path, codex_execut
     return command
 
 
+def extract_codex_failure_output(stdout: str) -> str:
+    lines: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        lowered = stripped.casefold()
+        is_codex_log = " error " in lowered and ("codex" in lowered or "api" in lowered)
+        is_error_line = stripped.startswith(("ERROR", "[ERROR]"))
+        is_network_error = any(
+            marker in lowered
+            for marker in (
+                "http error",
+                "unauthorized",
+                "forbidden",
+                "failed to connect",
+                "stream disconnected",
+                "error sending request",
+            )
+        )
+        if is_codex_log or is_error_line or is_network_error:
+            lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    tail = stdout.splitlines()[-20:]
+    return "\n".join(tail)
+
+
 def run_codex_doctor_analysis(ctx: Context, args: argparse.Namespace, doctor_output: str) -> int:
     codex_executable = tool_path("codex")
     if codex_executable is None:
@@ -537,23 +627,42 @@ def run_codex_doctor_analysis(ctx: Context, args: argparse.Namespace, doctor_out
         return 1
 
     prompt = build_codex_doctor_prompt(doctor_output, args.codex_extra_prompt)
-    command = build_codex_doctor_command(args, Path.cwd(), codex_executable)
-    if ctx.verbose:
-        ctx.info(f"run: {' '.join(shlex.quote(part) for part in command)}")
+    output_file: Path | None = None
     try:
+        output_fd, output_name = tempfile.mkstemp(prefix="codex-doctor-", suffix=".txt")
+        os.close(output_fd)
+        output_file = Path(output_name)
+        command = build_codex_doctor_command(args, Path.cwd(), codex_executable, output_file)
+        if ctx.verbose:
+            ctx.info(f"run: {' '.join(shlex.quote(part) for part in command)}")
         result = subprocess.run(command, input=prompt, text=True, capture_output=True, check=False)
     except OSError as exc:
         ctx.error(f"Failed to run codex exec: {exc}")
         return 1
 
-    if result.stdout:
-        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-    if result.stderr:
-        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
-    if result.returncode != 0:
+    try:
+        if result.returncode == 0:
+            final_message = ""
+            if output_file and output_file.is_file():
+                final_message = output_file.read_text(encoding="utf-8", errors="replace")
+            if final_message:
+                print(final_message, end="" if final_message.endswith("\n") else "\n")
+            elif result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            return 0
+
+        combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        failure_output = extract_codex_failure_output(combined_output)
+        if failure_output:
+            print(failure_output, end="" if failure_output.endswith("\n") else "\n")
         ctx.error(f"codex exec failed with exit code {result.returncode}")
         return 1
-    return 0
+    finally:
+        if output_file is not None:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
 
 
 def command_memories_adopt(ctx: Context) -> int:
@@ -667,7 +776,12 @@ def prepare_shared_layout(ctx: Context) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Prepare Codex shared skills and diagnostics.")
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Prepare Codex shared skills and diagnostics.",
+        epilog=MAIN_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
@@ -677,25 +791,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--syncthing-api-key", default=None)
 
     sub = parser.add_subparsers(dest="command", required=True)
-    install = sub.add_parser("install", help="Prepare shared folder and link shared user skills.")
+    install = sub.add_parser(
+        "install",
+        help="Prepare shared folder and link shared user skills. Options: --apply, --configure-syncthing.",
+        description="Prepare .codex-shared and link shared user skills into .codex/skills.",
+        epilog=INSTALL_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install.add_argument("--configure-syncthing", action="store_true")
-    doctor = sub.add_parser("doctor", help="Diagnose shared Codex setup.")
+    install.add_argument("--configure-syncthing", action="store_true", help="Try to add .codex-shared to the local Syncthing configuration.")
+    doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose shared Codex setup. Options: --codex, --codex-only, --codex-read-repo, --codex-profile, --codex-model, --codex-extra-prompt.",
+        description="Diagnose .codex/.codex-shared links, memories, shared skills, Git, and Syncthing availability.",
+        epilog=DOCTOR_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     doctor.add_argument("--codex", action="store_true", help="Ask Codex CLI to explain the captured diagnostics.")
     doctor.add_argument("--codex-only", action="store_true", help="Print only Codex analysis, suppressing raw doctor output.")
     doctor.add_argument("--codex-read-repo", action="store_true", help="Allow Codex analysis to read this repository in read-only mode.")
     doctor.add_argument("--codex-profile", default=None, help="Codex config profile to pass to 'codex exec'.")
     doctor.add_argument("--codex-model", default=None, help="Codex model to pass to 'codex exec'.")
     doctor.add_argument("--codex-extra-prompt", default=None, help="Extra instructions appended to the Codex analysis prompt.")
-    snapshot = sub.add_parser("snapshot", help="Create a local Git snapshot of .codex-shared.")
+    snapshot = sub.add_parser(
+        "snapshot",
+        help="Create a local Git snapshot of .codex-shared. Options: --apply.",
+        description="Create a local Git snapshot of .codex-shared for rollback/history.",
+        epilog=SNAPSHOT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    memories = sub.add_parser("memories", help="Manage Codex memories links between .codex and .codex-shared.")
+    memories = sub.add_parser(
+        "memories",
+        help="Manage Codex memories links between .codex and .codex-shared. Subcommands: adopt --apply, link --apply.",
+        description="Manage Codex memories as a whole-directory shared link.",
+        epilog=MEMORIES_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     memories_sub = memories.add_subparsers(dest="memories_command", required=True)
-    adopt = memories_sub.add_parser("adopt", help="Make the current local memories directory the shared source.")
+    adopt = memories_sub.add_parser(
+        "adopt",
+        help="Make the current local memories directory the shared source.",
+        description="Adopt the current real local .codex/memories directory as .codex-shared/memories.",
+        epilog=MEMORIES_ADOPT_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     adopt.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    link = memories_sub.add_parser("link", help="Link local memories to an existing shared memories directory.")
+    link = memories_sub.add_parser(
+        "link",
+        help="Link local memories to an existing shared memories directory.",
+        description="Link local .codex/memories to an existing .codex-shared/memories directory.",
+        epilog=MEMORIES_LINK_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
-    install_cli = sub.add_parser("install-cli", help=f"Install a local '{APP_NAME}' launcher.")
+    install_cli = sub.add_parser(
+        "install-cli",
+        help=f"Install a local '{APP_NAME}' launcher. Options: --apply, --bin-dir, --force, --no-path-update.",
+        description=f"Install or update a local '{APP_NAME}' command launcher.",
+        epilog=INSTALL_CLI_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     install_cli.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli.add_argument("--bin-dir", type=Path, default=default_bin_dir(), help="Directory where the launcher should be installed.")
     install_cli.add_argument("--force", action="store_true", help="Overwrite an existing launcher with different content.")
@@ -1344,6 +1500,55 @@ def command_self_test() -> int:
         )
         assert_true(version_command_result.returncode == 0, "version command should return 0")
         assert_true(version_command_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "version command should print app version")
+        root_help_result = subprocess.run(
+            [sys.executable, str(script_path), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(root_help_result.returncode == 0, "root --help should return 0")
+        root_help_compact = " ".join(root_help_result.stdout.split())
+        assert_true("command reference:" not in root_help_result.stdout, "root --help should not duplicate argparse sections")
+        assert_true("Options: --apply, --configure-syncthing" in root_help_compact, "root --help should show install options in command list")
+        assert_true("Options: --codex, --codex-only" in root_help_compact, "root --help should show doctor options in command list")
+        assert_true("Subcommands: adopt --apply, link --apply" in root_help_compact, "root --help should show memories subcommands in command list")
+        assert_true("install-cli Install a local" in root_help_compact, "root --help should show install-cli command")
+        assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
+        doctor_help_result = subprocess.run(
+            [sys.executable, str(script_path), "doctor", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(doctor_help_result.returncode == 0, "doctor --help should return 0")
+        assert_true("Codex analysis behavior:" in doctor_help_result.stdout, "doctor --help should include Codex behavior reference")
+        assert_true("--codex-read-repo" in doctor_help_result.stdout, "doctor --help should show read-repo option")
+        install_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_help_result.returncode == 0, "install --help should return 0")
+        assert_true("--configure-syncthing" in install_help_result.stdout, "install --help should show Syncthing option")
+        assert_true("Install behavior:" in install_help_result.stdout, "install --help should include behavior reference")
+        memories_help_result = subprocess.run(
+            [sys.executable, str(script_path), "memories", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(memories_help_result.returncode == 0, "memories --help should return 0")
+        assert_true("Memory sharing commands:" in memories_help_result.stdout, "memories --help should include subcommand reference")
+        install_cli_help_result = subprocess.run(
+            [sys.executable, str(script_path), "install-cli", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(install_cli_help_result.returncode == 0, "install-cli --help should return 0")
+        assert_true("--no-path-update" in install_cli_help_result.stdout, "install-cli --help should show PATH option")
+        assert_true("Launcher behavior:" in install_cli_help_result.stdout, "install-cli --help should include launcher behavior")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
             help_result = subprocess.run(
@@ -1378,13 +1583,22 @@ def command_self_test() -> int:
                     f"log_path = Path({str(fake_codex_log)!r})",
                     f"stdin_path = Path({str(fake_codex_stdin)!r})",
                     f"fail_path = Path({str(fake_codex_fail)!r})",
+                    "argv = sys.argv[1:]",
                     "stdin_text = sys.stdin.read()",
                     "stdin_path.write_text(stdin_text, encoding='utf-8', newline='\\n')",
-                    "log_path.write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii=False), encoding='utf-8', newline='\\n')",
+                    "log_path.write_text(json.dumps({'argv': argv}, ensure_ascii=False), encoding='utf-8', newline='\\n')",
                     "if fail_path.exists():",
-                    "    print('FAKE CODEX FAILURE', file=sys.stderr)",
+                    "    print('SECRET PROMPT SHOULD NOT PRINT')",
+                    "    print('ERROR: fake failure transcript line')",
+                    "    print('SECRET STDERR SHOULD NOT PRINT', file=sys.stderr)",
+                    "    print('ERROR: FAKE CODEX FAILURE', file=sys.stderr)",
                     "    raise SystemExit(7)",
-                    "print('FAKE CODEX ANALYSIS')",
+                    "analysis = 'FAKE CODEX ANALYSIS\\n'",
+                    "for index, value in enumerate(argv[:-1]):",
+                    "    if value in ('-o', '--output-last-message'):",
+                    "        Path(argv[index + 1]).write_text(analysis, encoding='utf-8', newline='\\n')",
+                    "        break",
+                    "print('FAKE CODEX TRANSCRIPT')",
                 ]
             )
             + "\n",
@@ -1455,11 +1669,14 @@ def command_self_test() -> int:
         )
         assert_true(CODEX_ANALYSIS_SEPARATOR in codex_result.stdout, "doctor --codex should print analysis separator")
         assert_true("FAKE CODEX ANALYSIS" in codex_result.stdout, "doctor --codex should print fake Codex output")
+        assert_true("FAKE CODEX TRANSCRIPT" not in codex_result.stdout, "doctor --codex should print final Codex message, not transcript stdout")
         assert_true("platform=" in codex_result.stdout, "doctor --codex should print raw doctor output by default")
 
         fake_argv = json.loads(fake_codex_log.read_text(encoding="utf-8"))["argv"]
-        assert_true(fake_argv[:2] == ["exec", "--ephemeral"], "doctor --codex should use codex exec --ephemeral")
+        assert_true(fake_argv[:4] == ["--ask-for-approval", "never", "exec", "--ephemeral"], "doctor --codex should use codex exec --ephemeral with global approval policy")
         assert_true("--sandbox" in fake_argv and "read-only" in fake_argv, "doctor --codex should use read-only sandbox")
+        assert_true("--color" in fake_argv and "never" in fake_argv, "doctor --codex should disable Codex output color")
+        assert_true("--output-last-message" in fake_argv, "doctor --codex should request final message output")
         assert_true("--ask-for-approval" in fake_argv and "never" in fake_argv, "doctor --codex should never request approval")
         assert_true(fake_argv[-1] == "-", "doctor --codex should pass prompt through stdin")
         fake_stdin = fake_codex_stdin.read_text(encoding="utf-8")
@@ -1518,6 +1735,10 @@ def command_self_test() -> int:
         )
         assert_true(failing_codex_result.returncode != 0, "doctor --codex should fail when codex exec fails")
         assert_true("codex exec failed with exit code" in failing_codex_result.stdout, "doctor --codex should report Codex exit code")
+        assert_true("ERROR: fake failure transcript line" in failing_codex_result.stdout, "doctor --codex should keep error-like Codex stdout lines")
+        assert_true("ERROR: FAKE CODEX FAILURE" in failing_codex_result.stdout, "doctor --codex should keep error-like Codex stderr lines")
+        assert_true("SECRET PROMPT SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex transcript")
+        assert_true("SECRET STDERR SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex stderr transcript")
         fake_codex_fail.unlink()
 
         adopt_case = case_dir / "memories-adopt"

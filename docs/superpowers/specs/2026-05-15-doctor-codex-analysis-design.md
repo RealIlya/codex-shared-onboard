@@ -41,14 +41,16 @@ Update both user-facing READMEs during implementation:
 The script runs Codex non-interactively:
 
 ```bash
-codex exec --ephemeral --sandbox read-only --ask-for-approval never -
+codex --ask-for-approval never exec --ephemeral --sandbox read-only --color never --output-last-message <tempfile> -
 ```
 
 Required properties:
 
 - `--ephemeral` is always used so the analysis does not persist a session file.
 - `--sandbox read-only` is always used so the analysis cannot write files.
-- `--ask-for-approval never` is always used so the non-interactive command cannot block on prompts.
+- `--ask-for-approval never` is always used as a global Codex CLI option before `exec` so the non-interactive command cannot block on prompts.
+- `--output-last-message <tempfile>` is used so the script prints only the final Codex answer on success, not the full Codex transcript/banner.
+- `--color never` is used so captured failure output is plain text.
 - The prompt is passed through stdin using `-`.
 - If `--codex-profile PROFILE` is set, pass `-p PROFILE`.
 - If `--codex-model MODEL` is set, pass `-m MODEL`.
@@ -75,8 +77,8 @@ The built-in prompt is English by default. The script does not infer the user's 
 1. `doctor` diagnostics are generated into an in-memory buffer instead of being printed directly.
 2. The script decides whether to print the raw diagnostics based on `--codex-only`.
 3. The script calls `codex exec` with the captured diagnostics in stdin.
-4. Codex stdout is printed to the script stdout.
-5. Codex stderr is printed to the script stderr.
+4. On success, the last Codex message is read from the temporary output file and printed to stdout.
+5. On failure, Codex stdout and stderr are filtered down to error-like lines before printing, so the wrapper does not dump the full prompt/transcript.
 6. The command exits after the Codex subprocess finishes.
 
 ## Exit Codes
@@ -114,7 +116,8 @@ Tests should cover:
 - `doctor --codex` prints raw doctor output, a separator, and fake Codex output
 - `doctor --codex --codex-only` suppresses raw doctor output
 - fake Codex non-zero exit makes the command return non-zero
-- the fake Codex receives `--ephemeral`, `--sandbox read-only`, and `--ask-for-approval never`
+- the fake Codex receives `--ephemeral`, `--sandbox read-only`, `--ask-for-approval never`, `--color never`, and `--output-last-message`
+- failure output keeps Codex error lines but does not print the full failed transcript
 
 The tests must not invoke the real Codex CLI and must not touch real `.codex` paths.
 
