@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 import ntpath
@@ -31,9 +32,13 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.4.0"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
+MEMORIES_PUBLISHED_DIR_NAME = "memories-published"
+MEMORIES_CURRENT_DIR_NAME = "current"
+MEMORIES_SNAPSHOTS_DIR_NAME = "snapshots"
+MEMORIES_MANIFEST_NAME = "manifest.json"
 MAIN_HELP_EPILOG = f"Run '{APP_NAME} <command> --help' for detailed command behavior."
 DOCTOR_HELP_EPILOG = """Codex analysis behavior:
   --codex
@@ -65,20 +70,47 @@ INSTALL_HELP_EPILOG = """Install behavior:
   Existing local skills are backed up before replacement when --apply is used.
 """
 MEMORIES_HELP_EPILOG = """Memory sharing commands:
-  adopt
+  adopt (DEPRECATED)
     Use on the source/writer machine when local .codex/memories is still the source of truth.
+    Prefer publish for new copy-based setups.
 
-  link
+  link (DEPRECATED)
     Use on additional machines after .codex-shared/memories already exists.
+    Prefer consume for new copy-based setups.
+
+  publish
+    Use on the writer machine to copy local .codex/memories into
+    .codex-shared/memories-published/current and create a snapshot.
+
+  consume
+    Use on reader machines to replace local .codex/memories with a validated
+    copy of .codex-shared/memories-published/current.
 """
-MEMORIES_ADOPT_HELP_EPILOG = """Adopt behavior:
+MEMORIES_ADOPT_HELP_EPILOG = """DEPRECATED:
+  Prefer 'memories publish' for new copy-based memories sharing.
+
+Adopt behavior:
   Requires a real local .codex/memories directory and no existing .codex-shared/memories.
   Copies local memories to .codex-shared/memories, backs up the original local directory,
   then links .codex/memories to .codex-shared/memories.
 """
-MEMORIES_LINK_HELP_EPILOG = """Link behavior:
+MEMORIES_LINK_HELP_EPILOG = """DEPRECATED:
+  Prefer 'memories consume' for new copy-based memories sharing.
+
+Link behavior:
   Requires an existing .codex-shared/memories directory.
   Backs up an existing local .codex/memories directory, then links .codex/memories to shared memories.
+"""
+MEMORIES_PUBLISH_HELP_EPILOG = """Publish behavior:
+  Requires a real local .codex/memories directory.
+  Refuses conflict-like memory files.
+  Copies local memories to .codex-shared/memories-published/current.
+  Writes a manifest.json with file hashes and keeps a timestamped snapshot.
+"""
+MEMORIES_CONSUME_HELP_EPILOG = """Consume behavior:
+  Requires .codex-shared/memories-published/current with a valid manifest.json.
+  Backs up an existing local .codex/memories path, including legacy links.
+  Replaces local memories with a real copied directory, not a shared link.
 """
 SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
   Initializes or reuses a Git repository in .codex-shared and commits the current shared state.
@@ -115,7 +147,10 @@ Rules:
 - Do not silently resolve Syncthing conflict files.
 - If memory conflicts exist, mention them before relying on memory-derived assumptions.
 - Do not manually edit MEMORY.md, memory_summary.md, or raw_memories.md unless explicitly requested.
-- Link .codex/memories to .codex-shared/memories as a whole directory so Codex-owned internals stay active.
+- Preferred WSL/Linux model: keep .codex/memories local, publish writer copies to
+  .codex-shared/memories-published/current, and consume validated copies on readers.
+- Legacy model: .codex/memories may be linked to .codex-shared/memories as a whole
+  directory only when the symlink/junction tradeoff is explicitly accepted.
 """
 
 MEMORY_KEY_FILES = ("MEMORY.md", "memory_summary.md", "raw_memories.md")
@@ -207,6 +242,18 @@ class Context:
     @property
     def shared_memories_dir(self) -> Path:
         return self.shared_dir / "memories"
+
+    @property
+    def published_memories_dir(self) -> Path:
+        return self.shared_dir / MEMORIES_PUBLISHED_DIR_NAME
+
+    @property
+    def published_current_dir(self) -> Path:
+        return self.published_memories_dir / MEMORIES_CURRENT_DIR_NAME
+
+    @property
+    def published_snapshots_dir(self) -> Path:
+        return self.published_memories_dir / MEMORIES_SNAPSHOTS_DIR_NAME
 
     def info(self, message: str) -> None:
         print(message)
@@ -517,6 +564,178 @@ def rename_path(ctx: Context, source: Path, target: Path, label: str) -> bool:
     return True
 
 
+def remove_path(ctx: Context, path: Path, label: str) -> bool:
+    ctx.plan(f"remove {label} {path}")
+    if not ctx.apply:
+        return True
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        ctx.error(f"Failed to remove {path}: {exc}")
+        return False
+    return True
+
+
+def next_unique_child(parent: Path, name: str) -> Path:
+    candidate = parent / name
+    if not candidate.exists() and not candidate.is_symlink():
+        return candidate
+    index = 1
+    while True:
+        numbered = parent / f"{name}-{index}"
+        if not numbered.exists() and not numbered.is_symlink():
+            return numbered
+        index += 1
+
+
+def iter_manifest_files(root: Path) -> Iterable[Path]:
+    for current_root, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort(key=str.casefold)
+        for filename in sorted(filenames, key=str.casefold):
+            path = Path(current_root) / filename
+            if path.name == MEMORIES_MANIFEST_NAME:
+                continue
+            yield path
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_memories_manifest(root: Path, source_label: str) -> dict[str, object]:
+    files: dict[str, dict[str, object]] = {}
+    for path in iter_manifest_files(root):
+        relative = path.relative_to(root).as_posix()
+        stat_result = path.stat()
+        files[relative] = {
+            "size": stat_result.st_size,
+            "sha256": sha256_file(path),
+        }
+    return {
+        "schema_version": 1,
+        "created_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": source_label,
+        "files": files,
+    }
+
+
+def write_memories_manifest(ctx: Context, root: Path, manifest: dict[str, object]) -> bool:
+    path = root / MEMORIES_MANIFEST_NAME
+    ctx.plan(f"write memories manifest {path}")
+    if not ctx.apply:
+        return True
+    try:
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    except OSError as exc:
+        ctx.error(f"Failed to write memories manifest {path}: {exc}")
+        return False
+    return True
+
+
+def validate_memories_manifest(ctx: Context, root: Path, label: str) -> bool:
+    manifest_path = root / MEMORIES_MANIFEST_NAME
+    if not manifest_path.is_file():
+        ctx.error(f"{label} is missing required manifest: {manifest_path}")
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        ctx.error(f"Failed to read {label} manifest {manifest_path}: {exc}")
+        return False
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        ctx.error(f"{label} manifest has invalid files section: {manifest_path}")
+        return False
+    ok = True
+    for relative, expected in sorted(files.items()):
+        if not isinstance(relative, str) or relative.startswith("/") or ".." in Path(relative).parts:
+            ctx.error(f"{label} manifest contains unsafe relative path: {relative!r}")
+            ok = False
+            continue
+        if not isinstance(expected, dict):
+            ctx.error(f"{label} manifest entry is invalid for {relative}")
+            ok = False
+            continue
+        path = root / relative
+        if not path.is_file():
+            ctx.error(f"{label} manifest file is missing: {path}")
+            ok = False
+            continue
+        try:
+            actual_size = path.stat().st_size
+            actual_sha256 = sha256_file(path)
+        except OSError as exc:
+            ctx.error(f"Failed to inspect {label} manifest file {path}: {exc}")
+            ok = False
+            continue
+        if expected.get("size") != actual_size:
+            ctx.error(f"{label} manifest size mismatch for {path}")
+            ok = False
+        if expected.get("sha256") != actual_sha256:
+            ctx.error(f"{label} manifest sha256 mismatch for {path}")
+            ok = False
+    return ok
+
+
+def inspect_memories_manifest(root: Path) -> tuple[bool, dict[str, object] | None, list[str]]:
+    manifest_path = root / MEMORIES_MANIFEST_NAME
+    issues: list[str] = []
+    if not manifest_path.is_file():
+        return False, None, [f"missing manifest: {manifest_path}"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, None, [f"failed to read manifest {manifest_path}: {exc}"]
+    if not isinstance(manifest, dict):
+        return False, None, [f"manifest is not an object: {manifest_path}"]
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return False, manifest, [f"manifest has invalid files section: {manifest_path}"]
+    for relative, expected in sorted(files.items()):
+        if not isinstance(relative, str) or relative.startswith("/") or ".." in Path(relative).parts:
+            issues.append(f"manifest contains unsafe relative path: {relative!r}")
+            continue
+        if not isinstance(expected, dict):
+            issues.append(f"manifest entry is invalid for {relative}")
+            continue
+        path = root / relative
+        if not path.is_file():
+            issues.append(f"manifest file is missing: {path}")
+            continue
+        try:
+            actual_size = path.stat().st_size
+            actual_sha256 = sha256_file(path)
+        except OSError as exc:
+            issues.append(f"failed to inspect manifest file {path}: {exc}")
+            continue
+        if expected.get("size") != actual_size:
+            issues.append(f"manifest size mismatch for {path}")
+        if expected.get("sha256") != actual_sha256:
+            issues.append(f"manifest sha256 mismatch for {path}")
+    return not issues, manifest, issues
+
+
+def count_snapshot_dirs(path: Path) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+    count = 0
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        if child.is_dir() and not is_link_like_path(child):
+            count += 1
+    return count
+
+
 def verify_memory_link(ctx: Context, link: Path, target: Path) -> bool:
     if not ctx.apply:
         return True
@@ -552,7 +771,7 @@ def build_codex_doctor_prompt(doctor_output: str, extra_prompt: str | None) -> s
         "Explain the current .codex/.codex-shared state from the doctor output below. Focus on:",
         "- errors that require action",
         "- warnings and whether they are expected",
-        "- memory linking state",
+        "- memory local/link/published state",
         "- shared skills linking state",
         "- Syncthing/tool availability",
         "- practical next steps",
@@ -732,6 +951,107 @@ def command_memories_link(ctx: Context) -> int:
     return 1 if ctx.errors else 0
 
 
+def command_memories_publish(ctx: Context) -> int:
+    local = ctx.memories_dir
+    current = ctx.published_current_dir
+
+    if not local.exists() or not local.is_dir() or is_link_like_path(local):
+        ctx.error(f"Publish requires a real local memories directory, not a link: {local}")
+        return 1
+    if not validate_no_conflicts(ctx, local, "local memories"):
+        return 1
+    if not ensure_dir(ctx, ctx.shared_dir):
+        return 1
+    if not ensure_dir(ctx, ctx.published_memories_dir):
+        return 1
+    if not ensure_dir(ctx, ctx.published_snapshots_dir):
+        return 1
+
+    warn_memory_key_files(ctx, local, "local memories")
+    stamp = now_stamp()
+    staging = next_unique_child(ctx.published_memories_dir, f".{MEMORIES_CURRENT_DIR_NAME}-staging-{stamp}")
+    snapshot = next_unique_child(ctx.published_snapshots_dir, stamp)
+    current_backup: Path | None = None
+
+    if not copy_directory_tree(ctx, local, staging):
+        return 1
+    manifest_root = staging if ctx.apply else local
+    manifest = build_memories_manifest(manifest_root, str(local))
+    if not write_memories_manifest(ctx, staging, manifest):
+        if path_exists_or_link(staging):
+            remove_path(ctx, staging, "staged published memories")
+        return 1
+    if not copy_directory_tree(ctx, staging, snapshot):
+        if path_exists_or_link(staging):
+            remove_path(ctx, staging, "staged published memories")
+        return 1
+    if path_exists_or_link(current):
+        current_backup = next_unique_child(ctx.published_memories_dir, f"{MEMORIES_CURRENT_DIR_NAME}.bak-publish-{stamp}")
+        if not rename_path(ctx, current, current_backup, "previous published current"):
+            if path_exists_or_link(staging):
+                remove_path(ctx, staging, "staged published memories")
+            return 1
+    if not rename_path(ctx, staging, current, "published memories current"):
+        if ctx.apply and current_backup is not None and path_exists_or_link(current_backup) and not path_exists_or_link(current):
+            rename_path(ctx, current_backup, current, "previous published current rollback")
+        if path_exists_or_link(staging):
+            remove_path(ctx, staging, "staged published memories")
+        return 1
+    if current_backup is not None and path_exists_or_link(current_backup):
+        if not remove_path(ctx, current_backup, "previous published current backup"):
+            return 1
+    return 1 if ctx.errors else 0
+
+
+def command_memories_consume(ctx: Context) -> int:
+    local = ctx.memories_dir
+    current = ctx.published_current_dir
+
+    if not current.exists() or not current.is_dir():
+        ctx.error(f"Published memories current is missing: {current}")
+        ctx.error("Run 'memories publish --apply' on the writer machine first.")
+        return 1
+    if not validate_memories_manifest(ctx, current, "published memories current"):
+        return 1
+    if not validate_no_conflicts(ctx, current, "published memories current"):
+        return 1
+    if path_exists_or_link(local):
+        if not is_link_like_path(local) and not local.is_dir():
+            ctx.error(f"Local memories path exists but is not a replaceable directory or link: {local}")
+            return 1
+        if not is_link_like_path(local) and not validate_no_conflicts(ctx, local, "local memories"):
+            return 1
+    if not ensure_dir(ctx, ctx.codex_dir):
+        return 1
+
+    warn_memory_key_files(ctx, current, "published memories current")
+    stamp = now_stamp()
+    staging = next_unique_child(ctx.codex_dir, f"memories.consume-staging-{stamp}")
+    backup: Path | None = None
+
+    if not copy_directory_tree(ctx, current, staging):
+        return 1
+    if ctx.apply and not validate_memories_manifest(ctx, staging, "staged consumed memories"):
+        remove_path(ctx, staging, "staged consumed memories")
+        return 1
+    if path_exists_or_link(local):
+        backup = next_backup_path(local)
+        if not rename_path(ctx, local, backup, "local memories to backup"):
+            if path_exists_or_link(staging):
+                remove_path(ctx, staging, "staged consumed memories")
+            return 1
+    if not rename_path(ctx, staging, local, "consumed memories into local path"):
+        if ctx.apply and backup is not None and path_exists_or_link(backup) and not path_exists_or_link(local):
+            rename_path(ctx, backup, local, "local memories rollback")
+        if path_exists_or_link(staging):
+            remove_path(ctx, staging, "staged consumed memories")
+        return 1
+    if ctx.apply and is_link_like_path(local):
+        ctx.error(f"Consume verification failed: local memories is still link-like: {local}")
+        return 1
+    return 1 if ctx.errors else 0
+
+
 def link_shared_skills(ctx: Context) -> None:
     if not ensure_dir(ctx, ctx.codex_dir):
         return
@@ -823,28 +1143,44 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     memories = sub.add_parser(
         "memories",
-        help="Manage Codex memories links between .codex and .codex-shared. Subcommands: adopt --apply, link --apply.",
-        description="Manage Codex memories as a whole-directory shared link.",
+        help="Manage Codex memories sharing. Subcommands: adopt --apply, link --apply, publish --apply, consume --apply.",
+        description="Manage Codex memories using legacy links or copy-based publish/consume.",
         epilog=MEMORIES_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     memories_sub = memories.add_subparsers(dest="memories_command", required=True)
     adopt = memories_sub.add_parser(
         "adopt",
-        help="Make the current local memories directory the shared source.",
-        description="Adopt the current real local .codex/memories directory as .codex-shared/memories.",
+        help="DEPRECATED: make the current local memories directory the linked shared source.",
+        description="DEPRECATED: adopt the current real local .codex/memories directory as .codex-shared/memories.",
         epilog=MEMORIES_ADOPT_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     adopt.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     link = memories_sub.add_parser(
         "link",
-        help="Link local memories to an existing shared memories directory.",
-        description="Link local .codex/memories to an existing .codex-shared/memories directory.",
+        help="DEPRECATED: link local memories to an existing shared memories directory.",
+        description="DEPRECATED: link local .codex/memories to an existing .codex-shared/memories directory.",
         epilog=MEMORIES_LINK_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     link.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
+    publish = memories_sub.add_parser(
+        "publish",
+        help="Publish local memories into .codex-shared/memories-published/current.",
+        description="Copy a real local .codex/memories directory into the shared published memories area.",
+        epilog=MEMORIES_PUBLISH_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    publish.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
+    consume = memories_sub.add_parser(
+        "consume",
+        help="Consume published memories into a real local .codex/memories directory.",
+        description="Replace local .codex/memories with a validated copy of shared published memories.",
+        epilog=MEMORIES_CONSUME_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    consume.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli = sub.add_parser(
         "install-cli",
         help=f"Install a local '{APP_NAME}' launcher. Options: --apply, --bin-dir, --force, --no-path-update.",
@@ -1214,8 +1550,65 @@ def find_conflict_files(root: Path) -> list[Path]:
     return sorted(conflicts, key=lambda item: str(item).casefold())
 
 
+def find_active_shared_conflict_files(shared_dir: Path) -> list[Path]:
+    archive_dir = shared_dir / "archive"
+    active_conflicts = []
+    for path in find_conflict_files(shared_dir):
+        try:
+            path.relative_to(archive_dir)
+            continue
+        except ValueError:
+            active_conflicts.append(path)
+    return active_conflicts
+
+
 def tool_path(name: str) -> str | None:
     return shutil.which(name)
+
+
+def print_memory_diagnostics(ctx: Context) -> None:
+    local_memories = ctx.memories_dir
+    shared_memories = ctx.shared_memories_dir
+    published_current = ctx.published_current_dir
+
+    if not path_exists_or_link(local_memories):
+        print(f"memories_local=missing path={local_memories}")
+        ctx.warn(f"Local memories path is missing: {local_memories}")
+    elif shared_memories.exists() and same_resolved_path(local_memories, shared_memories):
+        print(f"memories_local=legacy-linked local={local_memories} shared={shared_memories}")
+        ctx.warn("Legacy memories link is deprecated; prefer memories publish/consume.")
+        if not is_windows() and is_link_like_path(local_memories):
+            ctx.warn("WSL/Linux whole-directory memory symlink preserves Codex internals but may trigger sandbox issues.")
+    elif is_link_like_path(local_memories):
+        print(f"memories_local=link local={local_memories}")
+        ctx.warn("Local memories is link-like but does not resolve to legacy shared memories.")
+    elif local_memories.is_dir():
+        print(f"memories_local=real path={local_memories}")
+        if shared_memories.exists() and not published_current.exists():
+            ctx.warn(f"Local memories are not linked to legacy shared memories: {local_memories}")
+    else:
+        print(f"memories_local=invalid path={local_memories}")
+        ctx.warn(f"Local memories path exists but is not a directory: {local_memories}")
+
+    if published_current.exists() and published_current.is_dir():
+        valid, manifest, issues = inspect_memories_manifest(published_current)
+        if valid:
+            files = manifest.get("files", {}) if manifest else {}
+            created_at = manifest.get("created_at", "unknown") if manifest else "unknown"
+            source = manifest.get("source", "unknown") if manifest else "unknown"
+            print(f"memories_published=valid current={published_current} files={len(files)} created_at={created_at} source={source}")
+        else:
+            print(f"memories_published=invalid current={published_current}")
+            for issue in issues:
+                ctx.warn(f"Published memories manifest issue: {issue}")
+    elif ctx.published_memories_dir.exists():
+        print(f"memories_published=missing current={published_current}")
+        ctx.warn(f"Published memories current is missing: {published_current}")
+    else:
+        print(f"memories_published=missing current={published_current}")
+
+    snapshots = count_snapshot_dirs(ctx.published_snapshots_dir)
+    print(f"memories_published_snapshots={snapshots} path={ctx.published_snapshots_dir}")
 
 
 def print_doctor_diagnostics(ctx: Context) -> int:
@@ -1240,7 +1633,7 @@ def print_doctor_diagnostics(ctx: Context) -> int:
         if not path.is_file():
             ctx.warn(f"Missing shared file: {path}")
 
-    for path in find_conflict_files(ctx.shared_dir):
+    for path in find_active_shared_conflict_files(ctx.shared_dir):
         ctx.warn(f"Conflict-like file found: {path}")
 
     print(f"python={sys.version.split()[0]} ({sys.executable})")
@@ -1249,16 +1642,7 @@ def print_doctor_diagnostics(ctx: Context) -> int:
     print(f"git={git if git else 'missing'}")
     print(f"syncthing={syncthing if syncthing else 'missing'}")
 
-    local_memories = ctx.memories_dir
-    shared_memories = ctx.shared_memories_dir
-    if not path_exists_or_link(local_memories):
-        ctx.warn(f"Local memories path is missing: {local_memories}")
-    elif shared_memories.exists() and same_resolved_path(local_memories, shared_memories):
-        print(f"memories=linked local={local_memories} shared={shared_memories}")
-        if not is_windows() and is_link_like_path(local_memories):
-            ctx.warn("WSL/Linux whole-directory memory symlink preserves Codex internals but may trigger sandbox issues.")
-    elif shared_memories.exists():
-        ctx.warn(f"Local memories are not linked to shared memories: {local_memories}")
+    print_memory_diagnostics(ctx)
 
     for target in iter_shared_skills(ctx):
         local = ctx.skills_dir / target.name
@@ -1511,7 +1895,10 @@ def command_self_test() -> int:
         assert_true("command reference:" not in root_help_result.stdout, "root --help should not duplicate argparse sections")
         assert_true("Options: --apply, --configure-syncthing" in root_help_compact, "root --help should show install options in command list")
         assert_true("Options: --codex, --codex-only" in root_help_compact, "root --help should show doctor options in command list")
-        assert_true("Subcommands: adopt --apply, link --apply" in root_help_compact, "root --help should show memories subcommands in command list")
+        assert_true(
+            "Subcommands: adopt --apply, link --apply, publish --apply, consume --apply" in root_help_compact,
+            "root --help should show memories subcommands in command list",
+        )
         assert_true("install-cli Install a local" in root_help_compact, "root --help should show install-cli command")
         assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
         doctor_help_result = subprocess.run(
@@ -1540,6 +1927,23 @@ def command_self_test() -> int:
         )
         assert_true(memories_help_result.returncode == 0, "memories --help should return 0")
         assert_true("Memory sharing commands:" in memories_help_result.stdout, "memories --help should include subcommand reference")
+        assert_true("DEPRECATED" in memories_help_result.stdout, "memories --help should mark adopt/link as deprecated")
+        adopt_help_result = subprocess.run(
+            [sys.executable, str(script_path), "memories", "adopt", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(adopt_help_result.returncode == 0, "memories adopt --help should return 0")
+        assert_true("DEPRECATED" in adopt_help_result.stdout, "memories adopt --help should mark adopt as deprecated")
+        link_help_result = subprocess.run(
+            [sys.executable, str(script_path), "memories", "link", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(link_help_result.returncode == 0, "memories link --help should return 0")
+        assert_true("DEPRECATED" in link_help_result.stdout, "memories link --help should mark link as deprecated")
         install_cli_help_result = subprocess.run(
             [sys.executable, str(script_path), "install-cli", "--help"],
             text=True,
@@ -1566,6 +1970,9 @@ def command_self_test() -> int:
         conflict_file.write_text("conflict\n", encoding="utf-8", newline="\n")
         false_conflict_file = memories_dir / "branch_conflicts.md"
         false_conflict_file.write_text("ordinary memory note\n", encoding="utf-8", newline="\n")
+        archived_conflict_file = shared_dir / "archive" / "memory-conflicts" / "MEMORY.sync-conflict-archived.md"
+        archived_conflict_file.parent.mkdir(parents=True)
+        archived_conflict_file.write_text("archived conflict\n", encoding="utf-8", newline="\n")
         assert_true(false_conflict_file not in find_conflict_files(shared_dir), "ordinary files mentioning conflicts should not be treated as conflict files")
 
         fake_bin = case_dir / "fake-bin"
@@ -1650,6 +2057,7 @@ def command_self_test() -> int:
             conflict_file.name in doctor_output or "conflict" in doctor_output.casefold(),
             "doctor should report the conflict file",
         )
+        assert_true(archived_conflict_file.name not in doctor_output, "doctor should ignore archived conflict files")
 
         codex_result = run_script_with_fake_codex(
             [
@@ -1740,6 +2148,169 @@ def command_self_test() -> int:
         assert_true("SECRET PROMPT SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex transcript")
         assert_true("SECRET STDERR SHOULD NOT PRINT" not in failing_codex_result.stdout, "doctor --codex should not print full failed Codex stderr transcript")
         fake_codex_fail.unlink()
+
+        publish_case = case_dir / "memories-publish-consume"
+        writer_codex = publish_case / "writer" / ".codex"
+        reader_codex = publish_case / "reader" / ".codex"
+        published_shared = publish_case / ".codex-shared"
+        writer_memories = writer_codex / "memories"
+        reader_memories = reader_codex / "memories"
+        published_current = published_shared / "memories-published" / "current"
+        published_snapshots = published_shared / "memories-published" / "snapshots"
+        writer_memories.mkdir(parents=True)
+        (writer_memories / ".git").mkdir()
+        (writer_memories / ".agents").mkdir()
+        (writer_memories / ".codex").write_text("writer internal marker\n", encoding="utf-8", newline="\n")
+        (writer_memories / "MEMORY.md").write_text("writer aggregate\n", encoding="utf-8", newline="\n")
+        (writer_memories / "memory_summary.md").write_text("writer summary\n", encoding="utf-8", newline="\n")
+        (writer_memories / "raw_memories.md").write_text("writer raw\n", encoding="utf-8", newline="\n")
+        (writer_memories / "rollout_summaries").mkdir()
+        (writer_memories / "rollout_summaries" / "demo.jsonl").write_text("writer rollout\n", encoding="utf-8", newline="\n")
+
+        publish_dry_run_code = run_script(
+            [
+                "--codex-dir",
+                str(writer_codex),
+                "--shared-dir",
+                str(published_shared),
+                "memories",
+                "publish",
+            ]
+        )
+        assert_true(publish_dry_run_code == 0, "dry-run memories publish should return 0")
+        assert_true(not published_current.exists(), "dry-run memories publish should not create published current")
+
+        publish_apply_code = run_script(
+            [
+                "--codex-dir",
+                str(writer_codex),
+                "--shared-dir",
+                str(published_shared),
+                "memories",
+                "publish",
+                "--apply",
+            ]
+        )
+        assert_true(publish_apply_code == 0, "apply memories publish should return 0")
+        assert_true((published_current / "MEMORY.md").read_text(encoding="utf-8") == "writer aggregate\n", "publish should copy writer memories into current")
+        assert_true((published_current / ".git").is_dir(), "publish should include Codex-owned .git internals")
+        assert_true((published_current / ".agents").is_dir(), "publish should include Codex-owned .agents internals")
+        assert_true((published_current / ".codex").is_file(), "publish should include Codex-owned .codex internals")
+        assert_true((published_current / "manifest.json").is_file(), "publish should write a current manifest")
+        published_manifest = json.loads((published_current / "manifest.json").read_text(encoding="utf-8"))
+        assert_true("MEMORY.md" in published_manifest["files"], "publish manifest should list MEMORY.md")
+        assert_true("manifest.json" not in published_manifest["files"], "publish manifest should not list itself")
+        assert_true(len(list(published_snapshots.iterdir())) == 1, "publish should create one immutable snapshot")
+        writer_doctor_stdout = io.StringIO()
+        with contextlib.redirect_stdout(writer_doctor_stdout):
+            writer_doctor_code = run_script(
+                [
+                    "--codex-dir",
+                    str(writer_codex),
+                    "--shared-dir",
+                    str(published_shared),
+                    "doctor",
+                ]
+            )
+        writer_doctor_output = writer_doctor_stdout.getvalue()
+        assert_true(writer_doctor_code == 0, "doctor should return 0 for copy-based writer diagnostics")
+        assert_true("memories_local=real" in writer_doctor_output, "doctor should report real local memories")
+        assert_true("memories_published=valid" in writer_doctor_output, "doctor should report valid published memories")
+        assert_true("memories_published_snapshots=1" in writer_doctor_output, "doctor should report published snapshot count")
+
+        reader_memories.mkdir(parents=True)
+        (reader_memories / "MEMORY.md").write_text("stale reader aggregate\n", encoding="utf-8", newline="\n")
+        consume_dry_run_code = run_script(
+            [
+                "--codex-dir",
+                str(reader_codex),
+                "--shared-dir",
+                str(published_shared),
+                "memories",
+                "consume",
+            ]
+        )
+        assert_true(consume_dry_run_code == 0, "dry-run memories consume should return 0")
+        assert_true((reader_memories / "MEMORY.md").read_text(encoding="utf-8") == "stale reader aggregate\n", "dry-run memories consume should not replace local memories")
+
+        consume_apply_code = run_script(
+            [
+                "--codex-dir",
+                str(reader_codex),
+                "--shared-dir",
+                str(published_shared),
+                "memories",
+                "consume",
+                "--apply",
+            ]
+        )
+        assert_true(consume_apply_code == 0, "apply memories consume should return 0")
+        assert_true((reader_memories / "MEMORY.md").read_text(encoding="utf-8") == "writer aggregate\n", "consume should copy published memories into local memories")
+        assert_true(not is_link_like_path(reader_memories), "consume should leave local memories as a real directory, not a shared link")
+        reader_backups = sorted(reader_codex.glob("memories.bak-local-*"))
+        assert_true(len(reader_backups) == 1, "consume should backup existing local memories")
+        assert_true((reader_backups[0] / "MEMORY.md").read_text(encoding="utf-8") == "stale reader aggregate\n", "consume backup should keep original reader memories")
+        (reader_memories / "MEMORY.md").write_text("reader-only edit\n", encoding="utf-8", newline="\n")
+        assert_true((published_current / "MEMORY.md").read_text(encoding="utf-8") == "writer aggregate\n", "reader edits should not mutate published current")
+        reader_doctor_stdout = io.StringIO()
+        with contextlib.redirect_stdout(reader_doctor_stdout):
+            reader_doctor_code = run_script(
+                [
+                    "--codex-dir",
+                    str(reader_codex),
+                    "--shared-dir",
+                    str(published_shared),
+                    "doctor",
+                ]
+            )
+        reader_doctor_output = reader_doctor_stdout.getvalue()
+        assert_true(reader_doctor_code == 0, "doctor should return 0 for copy-based reader diagnostics")
+        assert_true("memories_local=real" in reader_doctor_output, "doctor should report consumed local memories as real")
+        assert_true("memories_published=valid" in reader_doctor_output, "doctor should report valid published memories for readers")
+
+        conflict_publish_case = case_dir / "memories-publish-conflict"
+        conflict_codex = conflict_publish_case / ".codex"
+        conflict_shared = conflict_publish_case / ".codex-shared"
+        conflict_memories = conflict_codex / "memories"
+        conflict_memories.mkdir(parents=True)
+        (conflict_memories / "MEMORY.md").write_text("ok\n", encoding="utf-8", newline="\n")
+        (conflict_memories / "raw_memories.sync-conflict-test.md").write_text("conflict\n", encoding="utf-8", newline="\n")
+        conflict_publish_code = run_script(
+            [
+                "--codex-dir",
+                str(conflict_codex),
+                "--shared-dir",
+                str(conflict_shared),
+                "memories",
+                "publish",
+                "--apply",
+            ]
+        )
+        assert_true(conflict_publish_code != 0, "memories publish should refuse conflict-like local memory files")
+        assert_true(not (conflict_shared / "memories-published" / "current").exists(), "failed publish should not create current")
+
+        bad_consume_case = case_dir / "memories-consume-bad-manifest"
+        bad_codex = bad_consume_case / ".codex"
+        bad_shared = bad_consume_case / ".codex-shared"
+        bad_local = bad_codex / "memories"
+        bad_current = bad_shared / "memories-published" / "current"
+        bad_local.mkdir(parents=True)
+        bad_current.mkdir(parents=True)
+        (bad_local / "MEMORY.md").write_text("local should stay\n", encoding="utf-8", newline="\n")
+        (bad_current / "MEMORY.md").write_text("published without manifest\n", encoding="utf-8", newline="\n")
+        bad_consume_code = run_script(
+            [
+                "--codex-dir",
+                str(bad_codex),
+                "--shared-dir",
+                str(bad_shared),
+                "memories",
+                "consume",
+                "--apply",
+            ]
+        )
+        assert_true(bad_consume_code != 0, "memories consume should refuse published current without manifest")
+        assert_true((bad_local / "MEMORY.md").read_text(encoding="utf-8") == "local should stay\n", "failed consume should keep local memories untouched")
 
         adopt_case = case_dir / "memories-adopt"
         adopt_codex = adopt_case / ".codex"
@@ -1871,6 +2442,10 @@ def main(argv: list[str] | None = None) -> int:
             return command_memories_adopt(ctx)
         if args.memories_command == "link":
             return command_memories_link(ctx)
+        if args.memories_command == "publish":
+            return command_memories_publish(ctx)
+        if args.memories_command == "consume":
+            return command_memories_consume(ctx)
     if args.command == "self-test":
         return command_self_test()
 

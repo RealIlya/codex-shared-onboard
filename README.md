@@ -7,7 +7,7 @@
 - `.codex-shared` is synced between machines with Syncthing.
 - `.codex` is not synced as a whole.
 - User skills are linked from `.codex-shared/skills-user` into local `.codex/skills`.
-- Codex memories can be linked through `.codex-shared/memories`.
+- Codex memories can be published into `.codex-shared/memories-published/current` and consumed as local copies.
 - Codex runtime state stays local: `config.toml`, `auth.json`, `rules/`, `sessions/`, `history.jsonl`, `state_*.sqlite*`, `logs_*.sqlite*`, `cache/`, `tmp/`, `.tmp/`, `.system/`.
 
 The script is dry-run by default. Real filesystem changes require `--apply`.
@@ -55,10 +55,12 @@ Commands:
 
 ```text
 install                     Prepare .codex-shared and link shared user skills into .codex/skills.
-doctor                      Diagnose paths, tools, shared files, memory layout, conflicts, and skill links.
+doctor                      Diagnose paths, tools, shared files, local/published memory status, conflicts, and skill links.
 snapshot                    Create a local Git snapshot of .codex-shared.
-memories adopt              Copy local .codex/memories into .codex-shared/memories and link local memories to the shared directory.
-memories link               Connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
+memories adopt              DEPRECATED: copy local .codex/memories into .codex-shared/memories and link local memories to the shared directory.
+memories link               DEPRECATED: connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
+memories publish            Copy local .codex/memories into .codex-shared/memories-published/current and keep a snapshot.
+memories consume            Replace local .codex/memories with a validated copy of .codex-shared/memories-published/current.
 install-cli                 Install a local codex-shared-onboard launcher.
 version                     Print the tool version.
 self-test                   Run the script's temporary-directory test suite.
@@ -81,8 +83,10 @@ doctor --codex-extra-prompt TEXT
 
 snapshot --apply            Initialize/use Git in .codex-shared and commit the current shared state.
 
-memories adopt --apply      Apply writer adoption. Refuses to overwrite existing .codex-shared/memories.
-memories link --apply       Apply reader/shared memory linking. Refuses to continue on memory conflict files.
+memories adopt --apply      DEPRECATED: apply writer adoption. Refuses to overwrite existing .codex-shared/memories.
+memories link --apply       DEPRECATED: apply reader/shared memory linking. Refuses to continue on memory conflict files.
+memories publish --apply    Apply copy-based writer publish. Refuses local memory conflict files.
+memories consume --apply    Apply copy-based reader consume. Requires a valid manifest.json.
 
 install-cli --apply         Write the launcher. Without it, print the planned changes only.
 install-cli --bin-dir PATH  Directory for the launcher. Defaults to ~/.local/bin.
@@ -97,7 +101,8 @@ Dry-run examples:
 python codex_shared_onboard.py install
 python codex_shared_onboard.py doctor --codex
 python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
-python codex_shared_onboard.py memories link
+python codex_shared_onboard.py memories publish
+python codex_shared_onboard.py memories consume
 python codex_shared_onboard.py snapshot
 ```
 
@@ -105,7 +110,8 @@ Apply examples:
 
 ```bash
 python codex_shared_onboard.py install --apply
-python codex_shared_onboard.py memories link --apply
+python codex_shared_onboard.py memories publish --apply
+python codex_shared_onboard.py memories consume --apply
 python codex_shared_onboard.py snapshot --apply
 ```
 
@@ -157,23 +163,31 @@ Sync only:
 ~/.codex-shared
 ```
 
-Local `.codex` consumes shared parts through links:
+Local `.codex` consumes shared skills through links:
 
 ```text
 ~/.codex/skills/<skill> -> ~/.codex-shared/skills-user/<skill>
 ```
 
-Memory linking uses a whole-directory link:
+The preferred memories model is copy-based:
 
 ```text
-Windows:
-  ~/.codex/memories -> ~/.codex-shared/memories
+Writer:
+  ~/.codex/memories -> publish copy -> ~/.codex-shared/memories-published/current
 
-WSL/Linux:
-  ~/.codex/memories -> ~/.codex-shared/memories
+Reader:
+  ~/.codex-shared/memories-published/current -> consume copy -> ~/.codex/memories
 ```
 
-This keeps Codex-owned memory internals such as `.git`, `.agents`, and `.codex` active under the local `~/.codex/memories` path. On WSL/Linux, this whole-directory symlink can trigger Codex sandbox/bubblewrap issues when the shared path crosses into `/mnt/c`. If that happens, do not delete `.git`; inspect the layout and decide manually.
+This keeps active `~/.codex/memories` local on every machine. Published copies include Codex-owned memory internals such as `.git`, `.agents`, and `.codex`, plus a `manifest.json` with file hashes.
+
+Legacy memory linking is still available through `memories adopt` and `memories link`:
+
+```text
+~/.codex/memories -> ~/.codex-shared/memories
+```
+
+Use the legacy whole-directory link only when that tradeoff is explicit. On WSL/Linux, a whole-directory symlink crossing into `/mnt/c` can trigger Codex sandbox/bubblewrap issues.
 
 ## First Machine / Writer
 
@@ -184,17 +198,17 @@ python codex_shared_onboard.py self-test
 python codex_shared_onboard.py doctor
 python codex_shared_onboard.py install
 python codex_shared_onboard.py install --apply
-python codex_shared_onboard.py memories adopt
-python codex_shared_onboard.py memories adopt --apply
+python codex_shared_onboard.py memories publish
+python codex_shared_onboard.py memories publish --apply
 ```
 
-`memories adopt --apply` does this:
+`memories publish --apply` does this:
 
-- Copies local `.codex/memories` into `.codex-shared/memories`.
-- Renames the old local `.codex/memories` to `memories.bak-local-YYYYMMDD-HHMMSS`.
-- Creates a whole-directory link from `.codex/memories` to `.codex-shared/memories`.
-- Does not delete the original memories.
-- Does not overwrite an existing `.codex-shared/memories`.
+- Requires local `.codex/memories` to be a real directory, not a symlink/junction.
+- Refuses conflict-like memory files.
+- Copies local `.codex/memories` into `.codex-shared/memories-published/current`.
+- Writes `manifest.json` with file sizes and SHA-256 hashes.
+- Keeps a timestamped copy under `.codex-shared/memories-published/snapshots/`.
 
 For the writer machine, use this in `~/.codex/config.toml`:
 
@@ -211,7 +225,7 @@ Prefer a single memories writer at a time.
 
 ## New Machine / Reader
 
-On a new machine, configure Syncthing first and wait until `.codex-shared` has arrived, including `.codex-shared/memories`.
+On a new machine, configure Syncthing first and wait until `.codex-shared` has arrived, including `.codex-shared/memories-published/current`.
 
 Then run:
 
@@ -220,16 +234,16 @@ python codex_shared_onboard.py self-test
 python codex_shared_onboard.py doctor
 python codex_shared_onboard.py install
 python codex_shared_onboard.py install --apply
-python codex_shared_onboard.py memories link
-python codex_shared_onboard.py memories link --apply
+python codex_shared_onboard.py memories consume
+python codex_shared_onboard.py memories consume --apply
 ```
 
-`memories link --apply` does this:
+`memories consume --apply` does this:
 
-- Verifies that `.codex-shared/memories` exists.
+- Verifies `.codex-shared/memories-published/current/manifest.json`.
+- Refuses conflict-like published memory files.
 - Backs up local `.codex/memories` if it exists.
-- Creates a whole-directory link from `.codex/memories` to `.codex-shared/memories`.
-- Does not copy local reader memories over shared memories.
+- Replaces local `.codex/memories` with a real copied directory, not a shared link.
 
 For a reader machine, use this in `~/.codex/config.toml`:
 
@@ -242,7 +256,15 @@ use_memories = true
 generate_memories = false
 ```
 
-This lets the reader consume shared memories without updating them.
+This lets the reader use memories without generating new memory state.
+
+## Legacy Memory Links
+
+`memories adopt` and `memories link` are deprecated and kept only for existing whole-directory link setups.
+
+Use `memories adopt --apply` on the original writer only when you want `.codex/memories` to become a link to `.codex-shared/memories`.
+
+Use `memories link --apply` on a reader only when `.codex-shared/memories` already exists and you explicitly accept the symlink/junction model.
 
 ## Syncthing
 
@@ -326,10 +348,10 @@ If conflicts exist:
 
 ## Recovery
 
-To roll back from shared memories:
+To roll back from consumed memories:
 
 1. Close Codex CLI.
-2. Remove the `.codex/memories` junction/symlink itself, not the `.codex-shared/memories` target.
+2. Rename the current `.codex/memories` out of the way.
 3. Rename the desired backup back to `.codex/memories`.
 
 Example backup:
@@ -338,7 +360,7 @@ Example backup:
 ~/.codex/memories.bak-local-YYYYMMDD-HHMMSS
 ```
 
-On Windows, remove the junction itself, not the target `.codex-shared/memories`.
+For legacy linked memories, remove the junction/symlink itself, not the target `.codex-shared/memories`.
 
 ## Important Limits
 
