@@ -38,6 +38,8 @@ python3 codex_shared_onboard.py doctor
 
 Runs local diagnostics. It may inspect real Codex/Syncthing paths but should not mutate them.
 
+`install-cli --apply` installs both `codex-shared-onboard` for setup and `codex-shared` for daily operator commands.
+
 ## Coding Style & Naming Conventions
 
 Follow the existing standard-library-only Python style. Use 4-space indentation, type hints for new helpers, and descriptive snake_case names. Keep filesystem mutations behind dry-run aware helpers and require `--apply` for real changes. Prefer explicit path checks over clever abstractions.

@@ -61,7 +61,7 @@ memories adopt              DEPRECATED: copy local .codex/memories into .codex-s
 memories link               DEPRECATED: connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
 memories publish            Copy local .codex/memories into .codex-shared/memories-published/current and keep a snapshot.
 memories consume            Replace local .codex/memories with a validated copy of .codex-shared/memories-published/current.
-install-cli                 Install a local codex-shared-onboard launcher.
+install-cli                 Install local codex-shared-onboard and codex-shared launchers.
 version                     Print the tool version.
 self-test                   Run the script's temporary-directory test suite.
 ```
@@ -88,7 +88,7 @@ memories link --apply       DEPRECATED: apply reader/shared memory linking. Refu
 memories publish --apply    Apply copy-based writer publish. Refuses local memory conflict files.
 memories consume --apply    Apply copy-based reader consume. Requires a valid manifest.json.
 
-install-cli --apply         Write the launcher. Without it, print the planned changes only.
+install-cli --apply         Write both launchers. Without it, print the planned changes only.
 install-cli --bin-dir PATH  Directory for the launcher. Defaults to ~/.local/bin.
 install-cli --force         Overwrite an existing launcher when its content differs.
 install-cli --no-path-update
@@ -115,22 +115,25 @@ python codex_shared_onboard.py memories consume --apply
 python codex_shared_onboard.py snapshot --apply
 ```
 
-## CLI Launcher
+## CLI Launchers
 
-To install a local `codex-shared-onboard` command:
+To install local command launchers:
 
 ```bash
 python codex_shared_onboard.py install-cli
 python codex_shared_onboard.py install-cli --apply
 ```
 
-By default this writes:
+By default this writes two commands:
 
 ```text
 ~/.local/bin/codex-shared-onboard
+~/.local/bin/codex-shared
 ```
 
-On Windows this writes `codex-shared-onboard.cmd` and adds the bin directory to
+Use `codex-shared-onboard` for first-machine setup and onboarding. Use `codex-shared` for daily operator commands such as `doctor`, `memories publish`, and `memories consume`.
+
+On Windows this writes `.cmd` launchers and adds the bin directory to
 the current user's `PATH`. Open a new terminal after installation.
 
 On Linux/macOS, make sure `~/.local/bin` is on `PATH`, then use:
@@ -138,16 +141,18 @@ On Linux/macOS, make sure `~/.local/bin` is on `PATH`, then use:
 ```bash
 codex-shared-onboard doctor
 codex-shared-onboard install --apply
+codex-shared doctor
+codex-shared memories publish
 ```
 
-The launcher is a small shim that points to this `codex_shared_onboard.py` file. Updating the checked-out script usually updates the installed command automatically:
+Each launcher is a small shim that points to this `codex_shared_onboard.py` file. Updating the checked-out script usually updates the installed commands automatically:
 
 ```bash
 git pull --ff-only
-codex-shared-onboard version
+codex-shared version
 ```
 
-Re-run `install-cli --apply --force` only when you moved the repository, changed the launcher target path, or need to replace a launcher with different content:
+Re-run `install-cli --apply --force` only when you moved the repository, changed the launcher target paths, or need to replace launchers with different content:
 
 ```bash
 python codex_shared_onboard.py install-cli --apply --force

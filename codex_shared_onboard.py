@@ -32,14 +32,15 @@ from typing import Iterable
 
 
 APP_NAME = "codex-shared-onboard"
+OPERATOR_APP_NAME = "codex-shared"
 APP_VERSION = "0.4.0"
+CLI_NAME_ENV = "CODEX_SHARED_CLI_NAME"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
 MEMORIES_PUBLISHED_DIR_NAME = "memories-published"
 MEMORIES_CURRENT_DIR_NAME = "current"
 MEMORIES_SNAPSHOTS_DIR_NAME = "snapshots"
 MEMORIES_MANIFEST_NAME = "manifest.json"
-MAIN_HELP_EPILOG = f"Run '{APP_NAME} <command> --help' for detailed command behavior."
 DOCTOR_HELP_EPILOG = """Codex analysis behavior:
   --codex
     Captures doctor diagnostics and sends them to 'codex exec' for explanation.
@@ -117,8 +118,9 @@ SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
   Dry-run is the default; use --apply to write the snapshot.
 """
 INSTALL_CLI_HELP_EPILOG = """Launcher behavior:
-  Installs a codex-shared-onboard wrapper into --bin-dir.
-  On Windows, the launcher is a .cmd file; on Unix-like systems, it is an executable script.
+  Installs codex-shared-onboard and codex-shared wrappers into --bin-dir.
+  Use codex-shared-onboard for setup/onboarding and codex-shared for daily operator commands.
+  On Windows, launchers are .cmd files; on Unix-like systems, they are executable scripts.
   PATH is updated when supported unless --no-path-update is set.
 """
 STIGNORE_TEXT = """(?d)**/__pycache__
@@ -1095,14 +1097,20 @@ def prepare_shared_layout(ctx: Context) -> None:
     write_text_if_missing(ctx, ctx.shared_dir / "memory-policy.md", MEMORY_POLICY_TEXT)
 
 
+def cli_display_name() -> str:
+    name = os.environ.get(CLI_NAME_ENV, "").strip()
+    return name if name else APP_NAME
+
+
 def build_parser() -> argparse.ArgumentParser:
+    prog_name = cli_display_name()
     parser = argparse.ArgumentParser(
-        prog=APP_NAME,
+        prog=prog_name,
         description="Prepare Codex shared skills and diagnostics.",
-        epilog=MAIN_HELP_EPILOG,
+        epilog=f"Run '{prog_name} <command> --help' for detailed command behavior.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
+    parser.add_argument("--version", action="version", version=f"{prog_name} {APP_VERSION}")
     parser.add_argument("--codex-dir", type=Path, default=default_codex_dir())
     parser.add_argument("--shared-dir", type=Path, default=default_shared_dir())
     parser.add_argument("--apply", action="store_true", help="Actually change files. Default is dry-run.")
@@ -1183,8 +1191,8 @@ def build_parser() -> argparse.ArgumentParser:
     consume.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     install_cli = sub.add_parser(
         "install-cli",
-        help=f"Install a local '{APP_NAME}' launcher. Options: --apply, --bin-dir, --force, --no-path-update.",
-        description=f"Install or update a local '{APP_NAME}' command launcher.",
+        help=f"Install local '{APP_NAME}' and '{OPERATOR_APP_NAME}' launchers. Options: --apply, --bin-dir, --force, --no-path-update.",
+        description=f"Install or update local '{APP_NAME}' and '{OPERATOR_APP_NAME}' command launchers.",
         epilog=INSTALL_CLI_HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1354,15 +1362,27 @@ def command_install(ctx: Context, configure_syncthing: bool, args: argparse.Name
     return 1 if ctx.errors else 0
 
 
-def cli_launcher_name() -> str:
-    return f"{APP_NAME}.cmd" if is_windows() else APP_NAME
+def cli_launcher_name(name: str) -> str:
+    return f"{name}.cmd" if is_windows() else name
 
 
-def render_cli_launcher(script_path: Path, python_executable: Path | None = None) -> str:
+def cli_launcher_names() -> tuple[str, str]:
+    return (APP_NAME, OPERATOR_APP_NAME)
+
+
+def render_windows_cli_launcher(script_path: Path, launcher_name: str, python_path: Path) -> str:
+    return f'@echo off\r\nsetlocal\r\nset "{CLI_NAME_ENV}={launcher_name}"\r\n"{python_path}" "{script_path}" %*\r\n'
+
+
+def render_cli_launcher(script_path: Path, launcher_name: str, python_executable: Path | None = None) -> str:
     python_path = python_executable or Path(sys.executable)
     if is_windows():
-        return f"@echo off\r\n\"{python_path}\" \"{script_path}\" %*\r\n"
-    return f"#!/usr/bin/env sh\nexec {shlex.quote(str(python_path))} {shlex.quote(str(script_path))} \"$@\"\n"
+        return render_windows_cli_launcher(script_path, launcher_name, python_path)
+    return (
+        "#!/usr/bin/env sh\n"
+        f"export {CLI_NAME_ENV}={shlex.quote(launcher_name)}\n"
+        f"exec {shlex.quote(str(python_path))} {shlex.quote(str(script_path))} \"$@\"\n"
+    )
 
 
 def ensure_executable(ctx: Context, path: Path) -> None:
@@ -1464,40 +1484,42 @@ def command_install_cli(ctx: Context, args: argparse.Namespace) -> int:
         return 1
 
     bin_dir = args.bin_dir.expanduser()
-    launcher = bin_dir / cli_launcher_name()
-    expected_text = render_cli_launcher(script_path)
-
-    if launcher.exists() or launcher.is_symlink():
-        if launcher.is_dir() and not launcher.is_symlink():
-            ctx.error(f"Launcher path exists as a directory: {launcher}")
-            return 1
-        try:
-            current_text = launcher.read_text(encoding="utf-8")
-        except OSError as exc:
-            ctx.error(f"Failed to read existing launcher {launcher}: {exc}")
-            return 1
-        if current_text == expected_text:
-            ctx.info(f"CLI launcher already installed: {launcher}")
-            ensure_executable(ctx, launcher)
-            return 1 if ctx.errors else 0
-        if not args.force:
-            ctx.error(f"Launcher already exists with different content: {launcher}. Re-run with --force to overwrite it.")
-            return 1
-
     if not ensure_dir(ctx, bin_dir):
         return 1
-    ctx.plan(f"write CLI launcher {launcher} -> {script_path}")
-    if ctx.apply:
-        try:
-            launcher.write_text(expected_text, encoding="utf-8", newline="")
-        except OSError as exc:
-            ctx.error(f"Failed to write CLI launcher {launcher}: {exc}")
-            return 1
-        ensure_executable(ctx, launcher)
+
+    for name in cli_launcher_names():
+        launcher = bin_dir / cli_launcher_name(name)
+        expected_text = render_cli_launcher(script_path, name)
+
+        if launcher.exists() or launcher.is_symlink():
+            if launcher.is_dir() and not launcher.is_symlink():
+                ctx.error(f"Launcher path exists as a directory: {launcher}")
+                continue
+            try:
+                current_text = launcher.read_text(encoding="utf-8")
+            except OSError as exc:
+                ctx.error(f"Failed to read existing launcher {launcher}: {exc}")
+                continue
+            if current_text == expected_text:
+                ctx.info(f"CLI launcher already installed: {launcher}")
+                ensure_executable(ctx, launcher)
+                continue
+            if not args.force:
+                ctx.error(f"Launcher already exists with different content: {launcher}. Re-run with --force to overwrite it.")
+                continue
+
+        ctx.plan(f"write CLI launcher {launcher} -> {script_path}")
+        if ctx.apply:
+            try:
+                launcher.write_text(expected_text, encoding="utf-8", newline="")
+            except OSError as exc:
+                ctx.error(f"Failed to write CLI launcher {launcher}: {exc}")
+                continue
+            ensure_executable(ctx, launcher)
     if is_windows() and not args.no_path_update:
         ensure_windows_user_path(ctx, bin_dir)
     elif not is_windows():
-        ctx.info(f"Make sure {bin_dir} is on PATH before running {APP_NAME}.")
+        ctx.info(f"Make sure {bin_dir} is on PATH before running {APP_NAME} or {OPERATOR_APP_NAME}.")
     return 1 if ctx.errors else 0
 
 
@@ -1678,7 +1700,7 @@ def command_doctor(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def command_version() -> int:
-    print(f"{APP_NAME} {APP_VERSION}")
+    print(f"{cli_display_name()} {APP_VERSION}")
     return 0
 
 
@@ -1842,7 +1864,8 @@ def command_self_test() -> int:
         assert_true(same_resolved_path(local_skill, shared_skill), "local demo-skill should resolve to shared skill")
 
         cli_bin_dir = case_dir / "bin"
-        cli_launcher = cli_bin_dir / cli_launcher_name()
+        cli_launcher = cli_bin_dir / cli_launcher_name(APP_NAME)
+        operator_launcher = cli_bin_dir / cli_launcher_name(OPERATOR_APP_NAME)
         cli_dry_run_code = run_script(
             [
                 "install-cli",
@@ -1853,6 +1876,7 @@ def command_self_test() -> int:
         )
         assert_true(cli_dry_run_code == 0, "dry-run install-cli should return 0")
         assert_true(not cli_launcher.exists(), "dry-run install-cli should not create launcher")
+        assert_true(not operator_launcher.exists(), "dry-run install-cli should not create operator launcher")
 
         cli_apply_code = run_script(
             [
@@ -1865,6 +1889,10 @@ def command_self_test() -> int:
         )
         assert_true(cli_apply_code == 0, "apply install-cli should return 0")
         assert_true(cli_launcher.is_file(), "install-cli should create launcher")
+        assert_true(operator_launcher.is_file(), "install-cli should create operator launcher")
+        windows_operator_launcher_text = render_windows_cli_launcher(Path("C:/Tools/codex_shared_onboard.py"), OPERATOR_APP_NAME, Path("C:/Python/python.exe"))
+        assert_true("setlocal" in windows_operator_launcher_text, "windows launcher should keep environment changes local")
+        assert_true(f'set "{CLI_NAME_ENV}={OPERATOR_APP_NAME}"' in windows_operator_launcher_text, "windows launcher should set operator CLI name")
         assert_true(windows_path_contains("C:\\Tools;C:\\Users\\Admin\\.local\\bin", Path("C:/Users/Admin/.local/bin")), "windows_path_contains should match normalized paths")
         assert_true(append_windows_path("C:\\Tools;", Path("C:/Users/Admin/.local/bin")) == f"C:\\Tools;{Path('C:/Users/Admin/.local/bin')}", "append_windows_path should append without duplicate separator")
         script_path = Path(__file__).resolve()
@@ -1899,7 +1927,7 @@ def command_self_test() -> int:
             "Subcommands: adopt --apply, link --apply, publish --apply, consume --apply" in root_help_compact,
             "root --help should show memories subcommands in command list",
         )
-        assert_true("install-cli Install a local" in root_help_compact, "root --help should show install-cli command")
+        assert_true("install-cli Install local" in root_help_compact, "root --help should show install-cli command")
         assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
         doctor_help_result = subprocess.run(
             [sys.executable, str(script_path), "doctor", "--help"],
@@ -1955,6 +1983,7 @@ def command_self_test() -> int:
         assert_true("Launcher behavior:" in install_cli_help_result.stdout, "install-cli --help should include launcher behavior")
         if not is_windows():
             assert_true(os.access(cli_launcher, os.X_OK), "install-cli launcher should be executable")
+            assert_true(os.access(operator_launcher, os.X_OK), "operator launcher should be executable")
             help_result = subprocess.run(
                 [str(cli_launcher), "--help"],
                 text=True,
@@ -1963,6 +1992,22 @@ def command_self_test() -> int:
             )
             assert_true(help_result.returncode == 0, "installed launcher should run --help")
             assert_true(APP_NAME in help_result.stdout, "installed launcher help should mention app name")
+            operator_help_result = subprocess.run(
+                [str(operator_launcher), "--help"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert_true(operator_help_result.returncode == 0, "operator launcher should run --help")
+            assert_true(f"usage: {OPERATOR_APP_NAME}" in operator_help_result.stdout, "operator launcher help should use operator command name")
+            operator_version_result = subprocess.run(
+                [str(operator_launcher), "--version"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert_true(operator_version_result.returncode == 0, "operator launcher should run --version")
+            assert_true(operator_version_result.stdout.strip() == f"{OPERATOR_APP_NAME} {APP_VERSION}", "operator launcher version should use operator command name")
 
         memories_dir = shared_dir / "memories"
         memories_dir.mkdir()
