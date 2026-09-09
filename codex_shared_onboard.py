@@ -33,7 +33,7 @@ from typing import Iterable
 
 APP_NAME = "codex-shared-onboard"
 OPERATOR_APP_NAME = "codex-shared"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 CLI_NAME_ENV = "CODEX_SHARED_CLI_NAME"
 CODEX_ANALYSIS_SEPARATOR = "--- Codex analysis ---"
 DEFAULT_SYNCTHING_URL = "http://127.0.0.1:8384"
@@ -113,6 +113,17 @@ MEMORIES_CONSUME_HELP_EPILOG = """Consume behavior:
   Backs up an existing local .codex/memories path, including legacy links.
   Replaces local memories with a real copied directory, not a shared link.
 """
+SKILLS_HELP_EPILOG = """Skill sharing commands:
+  publish NAME
+    Publishes a real local .codex/skills/NAME directory into
+    .codex-shared/skills-user/NAME and replaces the local directory with a link.
+"""
+SKILLS_PUBLISH_HELP_EPILOG = """Publish behavior:
+  NAME is the skill directory slug and must match the 'name' field in SKILL.md.
+  Requires a real local skill directory, not a symlink or junction.
+  Refuses to overwrite an existing shared skill unless --force is set.
+  Backs up replaced local and shared directories outside active skill roots.
+"""
 SNAPSHOT_HELP_EPILOG = """Snapshot behavior:
   Initializes or reuses a Git repository in .codex-shared and commits the current shared state.
   Dry-run is the default; use --apply to write the snapshot.
@@ -156,6 +167,7 @@ Rules:
 """
 
 MEMORY_KEY_FILES = ("MEMORY.md", "memory_summary.md", "raw_memories.md")
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 WINDOWS_PATH_REGISTRY_KEY = "Environment"
 WINDOWS_PATH_VALUE_NAME = "Path"
 
@@ -236,6 +248,10 @@ class Context:
     @property
     def shared_skills_dir(self) -> Path:
         return self.shared_dir / "skills-user"
+
+    @property
+    def shared_skills_backups_dir(self) -> Path:
+        return self.shared_dir / "skills-backups"
 
     @property
     def memories_dir(self) -> Path:
@@ -497,11 +513,11 @@ def replace_wrong_symlink(ctx: Context, link: Path, pending: Path) -> None:
             restore_symlink(ctx, link, old_target)
 
 
-def replace_local_skill(ctx: Context, link: Path, pending: Path, backup: Path) -> None:
+def replace_local_skill(ctx: Context, link: Path, pending: Path, backup: Path) -> bool:
     ctx.plan(f"rename local skill {link} -> {backup}")
     ctx.plan(f"rename staged link {pending} -> {link}")
     if not ctx.apply:
-        return
+        return True
     try:
         backup.parent.mkdir(parents=True, exist_ok=True)
         link.rename(backup)
@@ -514,10 +530,56 @@ def replace_local_skill(ctx: Context, link: Path, pending: Path, backup: Path) -
             except OSError as rollback_exc:
                 ctx.error(f"Failed to restore local skill {backup} -> {link}: {rollback_exc}")
         remove_pending_link(ctx, pending)
+        return False
+    return True
 
 
 def path_exists_or_link(path: Path) -> bool:
     return path.exists() or path.is_symlink()
+
+
+def validate_skill_name(ctx: Context, name: str) -> bool:
+    if SKILL_NAME_PATTERN.fullmatch(name):
+        return True
+    ctx.error(f"Invalid skill name '{name}'. Use lowercase letters, digits, and single hyphens.")
+    return False
+
+
+def read_skill_frontmatter_name(ctx: Context, skill_dir: Path, label: str) -> str | None:
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_file.is_file():
+        ctx.error(f"{label} is missing SKILL.md: {skill_file}")
+        return None
+    try:
+        lines = skill_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        ctx.error(f"Failed to read {skill_file}: {exc}")
+        return None
+    if not lines or lines[0].strip() != "---":
+        ctx.error(f"{label} SKILL.md is missing YAML frontmatter: {skill_file}")
+        return None
+
+    frontmatter_closed = False
+    skill_name: str | None = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            frontmatter_closed = True
+            break
+        match = re.fullmatch(r"\s*name\s*:\s*(.*?)\s*", line)
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        skill_name = value
+
+    if not frontmatter_closed:
+        ctx.error(f"{label} SKILL.md has unclosed YAML frontmatter: {skill_file}")
+        return None
+    if not skill_name:
+        ctx.error(f"{label} SKILL.md is missing the 'name' field: {skill_file}")
+        return None
+    return skill_name
 
 
 def is_link_like_path(path: Path) -> bool:
@@ -1086,6 +1148,97 @@ def link_shared_skills(ctx: Context) -> None:
             replace_local_skill(ctx, link, pending, backup)
 
 
+def rollback_shared_skill_publish(ctx: Context, target: Path, shared_backup: Path | None) -> None:
+    if not ctx.apply:
+        return
+    if path_exists_or_link(target):
+        remove_path(ctx, target, "failed published skill")
+    if shared_backup is not None and path_exists_or_link(shared_backup):
+        rename_path(ctx, shared_backup, target, "shared skill rollback")
+
+
+def command_skills_publish(ctx: Context, args: argparse.Namespace) -> int:
+    name = args.skill_name
+    if not validate_skill_name(ctx, name):
+        return 1
+
+    local = ctx.skills_dir / name
+    target = ctx.shared_skills_dir / name
+    if path_exists_or_link(local) and same_resolved_path(local, target):
+        ctx.info(f"Skill already published and linked: {local} -> {target}")
+        return 0
+    if not local.exists() or not local.is_dir():
+        ctx.error(f"Local skill directory is missing: {local}")
+        return 1
+    if is_link_like_path(local):
+        ctx.error(f"Publish requires a real local skill directory, not a link: {local}")
+        return 1
+
+    declared_name = read_skill_frontmatter_name(ctx, local, "Local skill")
+    if declared_name is None:
+        return 1
+    if declared_name != name:
+        ctx.error(f"Skill name mismatch: directory is '{name}' but SKILL.md declares '{declared_name}'.")
+        return 1
+
+    target_exists = path_exists_or_link(target)
+    if target_exists:
+        if is_link_like_path(target) or not target.is_dir():
+            ctx.error(f"Shared skill path is not a replaceable real directory: {target}")
+            return 1
+        if not args.force:
+            ctx.error(f"Shared skill already exists: {target}. Re-run with --force to replace it.")
+            return 1
+
+    if not ensure_dir(ctx, ctx.shared_dir):
+        return 1
+    if not ensure_dir(ctx, ctx.shared_skills_dir):
+        return 1
+
+    stamp = now_stamp()
+    staging = next_unique_child(ctx.shared_dir, f".skill-publish-{name}-{stamp}")
+    if not copy_directory_tree(ctx, local, staging):
+        return 1
+
+    shared_backup: Path | None = None
+    if target_exists:
+        if not ensure_dir(ctx, ctx.shared_skills_backups_dir):
+            if path_exists_or_link(staging):
+                remove_path(ctx, staging, "staged skill publish")
+            return 1
+        shared_backup = next_unique_child(ctx.shared_skills_backups_dir, f"{name}.bak-shared-{stamp}")
+        if not rename_path(ctx, target, shared_backup, "shared skill to backup"):
+            if path_exists_or_link(staging):
+                remove_path(ctx, staging, "staged skill publish")
+            return 1
+
+    if not rename_path(ctx, staging, target, "published skill into shared directory"):
+        if ctx.apply and shared_backup is not None and path_exists_or_link(shared_backup):
+            rename_path(ctx, shared_backup, target, "shared skill rollback")
+        if path_exists_or_link(staging):
+            remove_path(ctx, staging, "staged skill publish")
+        return 1
+
+    pending = next_pending_link_path(local)
+    if not create_directory_link(ctx, pending, target):
+        rollback_shared_skill_publish(ctx, target, shared_backup)
+        return 1
+
+    local_backup = next_backup_path_in_dir(local, ctx.skills_backups_dir)
+    if not replace_local_skill(ctx, local, pending, local_backup):
+        rollback_shared_skill_publish(ctx, target, shared_backup)
+        return 1
+    if ctx.apply and not same_resolved_path(local, target):
+        ctx.error(f"Published skill link verification failed: {local} does not resolve to {target}")
+        if path_exists_or_link(local):
+            remove_path(ctx, local, "failed published skill link")
+        if path_exists_or_link(local_backup):
+            rename_path(ctx, local_backup, local, "local skill rollback")
+        rollback_shared_skill_publish(ctx, target, shared_backup)
+        return 1
+    return 1 if ctx.errors else 0
+
+
 def prepare_shared_layout(ctx: Context) -> None:
     if not ensure_dir(ctx, ctx.shared_dir):
         return
@@ -1149,6 +1302,24 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     snapshot.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
+    skills = sub.add_parser(
+        "skills",
+        help="Manage shared Codex skills. Subcommands: publish NAME --apply.",
+        description="Publish local Codex skills into the shared skills layer.",
+        epilog=SKILLS_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    skills_sub = skills.add_subparsers(dest="skills_command", required=True)
+    skills_publish = skills_sub.add_parser(
+        "publish",
+        help="Publish a real local skill directory into .codex-shared/skills-user.",
+        description="Publish a local skill and replace it with a link to the shared copy.",
+        epilog=SKILLS_PUBLISH_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    skills_publish.add_argument("skill_name", metavar="NAME", help="Skill slug; must match the SKILL.md frontmatter name.")
+    skills_publish.add_argument("--force", action="store_true", help="Replace an existing shared skill after backing it up.")
+    skills_publish.add_argument("--apply", action="store_true", default=argparse.SUPPRESS, help="Actually change files. Default is dry-run.")
     memories = sub.add_parser(
         "memories",
         help="Manage Codex memories sharing. Subcommands: adopt --apply, link --apply, publish --apply, consume --apply.",
@@ -1863,6 +2034,149 @@ def command_self_test() -> int:
         assert_true((local_skill / "SKILL.md").read_text(encoding="utf-8") == "# Shared demo skill\n", "local skill should expose shared SKILL.md")
         assert_true(same_resolved_path(local_skill, shared_skill), "local demo-skill should resolve to shared skill")
 
+        publish_skill_name = "decision-brainstorming"
+        publish_local_skill = codex_dir / "skills" / publish_skill_name
+        publish_shared_skill = shared_dir / "skills-user" / publish_skill_name
+        publish_local_skill.mkdir()
+        (publish_local_skill / "SKILL.md").write_text(
+            "---\nname: decision-brainstorming\ndescription: Compare options.\n---\n\n# Decision Brainstorming\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (publish_local_skill / "notes.txt").write_text("local source\n", encoding="utf-8", newline="\n")
+        publish_skill_dry_run_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                publish_skill_name,
+            ]
+        )
+        assert_true(publish_skill_dry_run_code == 0, "dry-run skills publish should return 0")
+        assert_true(not publish_shared_skill.exists(), "dry-run skills publish should not create shared skill")
+        assert_true(not is_link_like_path(publish_local_skill), "dry-run skills publish should keep local skill real")
+
+        publish_skill_apply_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                publish_skill_name,
+                "--apply",
+            ]
+        )
+        assert_true(publish_skill_apply_code == 0, "apply skills publish should return 0")
+        assert_true((publish_shared_skill / "notes.txt").read_text(encoding="utf-8") == "local source\n", "skills publish should copy local skill content")
+        assert_true(same_resolved_path(publish_local_skill, publish_shared_skill), "skills publish should link local skill to shared copy")
+        publish_local_backups = sorted((codex_dir / "skills-backups").glob(f"{publish_skill_name}.bak-local-*"))
+        assert_true(len(publish_local_backups) == 1, "skills publish should backup original local skill")
+        assert_true((publish_local_backups[0] / "notes.txt").read_text(encoding="utf-8") == "local source\n", "local skill backup should preserve source content")
+
+        publish_skill_repeat_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                publish_skill_name,
+                "--apply",
+            ]
+        )
+        assert_true(publish_skill_repeat_code == 0, "re-publishing an already linked skill should return 0")
+        assert_true(
+            len(sorted((codex_dir / "skills-backups").glob(f"{publish_skill_name}.bak-local-*"))) == 1,
+            "re-publishing an already linked skill should not create another backup",
+        )
+
+        invalid_name_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                "../escape",
+                "--apply",
+            ]
+        )
+        assert_true(invalid_name_code == 1, "skills publish should reject path-like skill names")
+        assert_true(not (shared_dir / "escape").exists(), "invalid skill name should not create paths outside skills-user")
+
+        mismatch_name = "mismatched-skill"
+        mismatch_local_skill = codex_dir / "skills" / mismatch_name
+        mismatch_local_skill.mkdir()
+        (mismatch_local_skill / "SKILL.md").write_text(
+            "---\nname: different-name\ndescription: Invalid fixture.\n---\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        mismatch_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                mismatch_name,
+                "--apply",
+            ]
+        )
+        assert_true(mismatch_code == 1, "skills publish should reject mismatched frontmatter name")
+        assert_true(not (shared_dir / "skills-user" / mismatch_name).exists(), "mismatched skill should not be published")
+
+        force_name = "replace-skill"
+        force_local_skill = codex_dir / "skills" / force_name
+        force_shared_skill = shared_dir / "skills-user" / force_name
+        force_local_skill.mkdir()
+        force_shared_skill.mkdir()
+        force_skill_header = "---\nname: replace-skill\ndescription: Replace fixture.\n---\n"
+        (force_local_skill / "SKILL.md").write_text(force_skill_header, encoding="utf-8", newline="\n")
+        (force_local_skill / "version.txt").write_text("new\n", encoding="utf-8", newline="\n")
+        (force_shared_skill / "SKILL.md").write_text(force_skill_header, encoding="utf-8", newline="\n")
+        (force_shared_skill / "version.txt").write_text("old\n", encoding="utf-8", newline="\n")
+        publish_existing_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                force_name,
+                "--apply",
+            ]
+        )
+        assert_true(publish_existing_code == 1, "skills publish should refuse existing shared skill without force")
+        assert_true((force_shared_skill / "version.txt").read_text(encoding="utf-8") == "old\n", "refused publish should keep existing shared skill")
+        publish_force_code = run_script(
+            [
+                "--codex-dir",
+                str(codex_dir),
+                "--shared-dir",
+                str(shared_dir),
+                "skills",
+                "publish",
+                force_name,
+                "--force",
+                "--apply",
+            ]
+        )
+        assert_true(publish_force_code == 0, "forced skills publish should return 0")
+        assert_true((force_shared_skill / "version.txt").read_text(encoding="utf-8") == "new\n", "forced publish should replace shared skill")
+        force_shared_backups = sorted((shared_dir / "skills-backups").glob(f"{force_name}.bak-shared-*"))
+        assert_true(len(force_shared_backups) == 1, "forced publish should backup existing shared skill")
+        assert_true((force_shared_backups[0] / "version.txt").read_text(encoding="utf-8") == "old\n", "shared skill backup should preserve previous content")
+
         cli_bin_dir = case_dir / "bin"
         cli_launcher = cli_bin_dir / cli_launcher_name(APP_NAME)
         operator_launcher = cli_bin_dir / cli_launcher_name(OPERATOR_APP_NAME)
@@ -1927,6 +2241,8 @@ def command_self_test() -> int:
             "Subcommands: adopt --apply, link --apply, publish --apply, consume --apply" in root_help_compact,
             "root --help should show memories subcommands in command list",
         )
+        assert_true("skills Manage shared Codex skills" in root_help_compact, "root --help should show skills command")
+        assert_true("publish NAME --apply" in root_help_compact, "root --help should show skills publish syntax")
         assert_true("install-cli Install local" in root_help_compact, "root --help should show install-cli command")
         assert_true("--bin-dir" in root_help_compact and "--force" in root_help_compact, "root --help should show install-cli options in command list")
         doctor_help_result = subprocess.run(
@@ -1947,6 +2263,23 @@ def command_self_test() -> int:
         assert_true(install_help_result.returncode == 0, "install --help should return 0")
         assert_true("--configure-syncthing" in install_help_result.stdout, "install --help should show Syncthing option")
         assert_true("Install behavior:" in install_help_result.stdout, "install --help should include behavior reference")
+        skills_help_result = subprocess.run(
+            [sys.executable, str(script_path), "skills", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(skills_help_result.returncode == 0, "skills --help should return 0")
+        assert_true("Skill sharing commands:" in skills_help_result.stdout, "skills --help should include subcommand reference")
+        skills_publish_help_result = subprocess.run(
+            [sys.executable, str(script_path), "skills", "publish", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_true(skills_publish_help_result.returncode == 0, "skills publish --help should return 0")
+        assert_true("--force" in skills_publish_help_result.stdout, "skills publish --help should show force option")
+        assert_true("must match the 'name' field" in skills_publish_help_result.stdout, "skills publish --help should explain skill identity")
         memories_help_result = subprocess.run(
             [sys.executable, str(script_path), "memories", "--help"],
             text=True,
@@ -2478,6 +2811,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_doctor(ctx, args)
     if args.command == "snapshot":
         return command_snapshot(ctx)
+    if args.command == "skills":
+        if args.skills_command == "publish":
+            return command_skills_publish(ctx, args)
     if args.command == "install-cli":
         return command_install_cli(ctx, args)
     if args.command == "version":
