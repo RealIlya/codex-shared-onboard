@@ -57,6 +57,7 @@ Commands:
 install                     Prepare .codex-shared and link shared user skills into .codex/skills.
 doctor                      Diagnose paths, tools, shared files, local/published memory status, conflicts, and skill links.
 snapshot                    Create a local Git snapshot of .codex-shared.
+skills publish NAME         Publish a local skill into .codex-shared/skills-user and link it locally.
 memories adopt              DEPRECATED: copy local .codex/memories into .codex-shared/memories and link local memories to the shared directory.
 memories link               DEPRECATED: connect local .codex/memories to an existing .codex-shared/memories without copying local reader memories over shared memories.
 memories publish            Copy local .codex/memories into .codex-shared/memories-published/current and keep a snapshot.
@@ -83,6 +84,9 @@ doctor --codex-extra-prompt TEXT
 
 snapshot --apply            Initialize/use Git in .codex-shared and commit the current shared state.
 
+skills publish NAME --apply Publish a real local .codex/skills/NAME directory and replace it with a shared link.
+skills publish NAME --force Replace an existing shared skill after backing it up.
+
 memories adopt --apply      DEPRECATED: apply writer adoption. Refuses to overwrite existing .codex-shared/memories.
 memories link --apply       DEPRECATED: apply reader/shared memory linking. Refuses to continue on memory conflict files.
 memories publish --apply    Apply copy-based writer publish. Refuses local memory conflict files.
@@ -101,6 +105,7 @@ Dry-run examples:
 python codex_shared_onboard.py install
 python codex_shared_onboard.py doctor --codex
 python codex_shared_onboard.py doctor --codex --codex-extra-prompt "Answer in Russian."
+python codex_shared_onboard.py skills publish decision-brainstorming
 python codex_shared_onboard.py memories publish
 python codex_shared_onboard.py memories consume
 python codex_shared_onboard.py snapshot
@@ -110,6 +115,7 @@ Apply examples:
 
 ```bash
 python codex_shared_onboard.py install --apply
+python codex_shared_onboard.py skills publish decision-brainstorming --apply
 python codex_shared_onboard.py memories publish --apply
 python codex_shared_onboard.py memories consume --apply
 python codex_shared_onboard.py snapshot --apply
@@ -193,6 +199,19 @@ Legacy memory linking is still available through `memories adopt` and `memories 
 ```
 
 Use the legacy whole-directory link only when that tradeoff is explicit. On WSL/Linux, a whole-directory symlink crossing into `/mnt/c` can trigger Codex sandbox/bubblewrap issues.
+
+## Publishing a Local Skill
+
+Publish a real local skill directory from the host machine:
+
+```bash
+codex-shared skills publish decision-brainstorming
+codex-shared skills publish decision-brainstorming --apply
+```
+
+The command argument is the skill slug. It must match both the local directory name and the `name` field in `SKILL.md`; skills do not have a separate UUID. The command copies the skill into `.codex-shared/skills-user`, backs up the original local directory under `.codex/skills-backups`, and replaces it with a link to the shared copy.
+
+Publishing refuses an existing shared skill by default. Use `--force` only when you intend to replace it; the previous shared version is preserved under `.codex-shared/skills-backups`.
 
 ## First Machine / Writer
 
